@@ -1,3 +1,7 @@
+// ═══════════════════════════════════════════════════════════════
+// audio.rs  —  full file
+// ═══════════════════════════════════════════════════════════════
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +17,7 @@ use realfft::{RealFftPlanner, RealToComplex};
 use wasapi::*;
 
 use crate::config::{
-    AudioSettings, BpmMultiplier, ChannelMixMode, DecayMode,
+    AudioSettings, BeatFocusMode, BpmMultiplier, ChannelMixMode, DecayMode,
     FrequencyScaling, WeightingCurve, WindowFunction,
 };
 
@@ -77,8 +81,6 @@ impl BarFrame {
         }
     }
 
-    /// Linear interpolate this frame toward `next` by `alpha ∈ [0,1]`.
-    /// Arrays with mismatched lengths are handled gracefully (shorter wins).
     pub fn lerp_toward(&self, next: &BarFrame, alpha: f32) -> BarFrame {
         let a = alpha.clamp(0.0, 1.0);
         let blend = |x: f32, y: f32| x * (1.0 - a) + y * a;
@@ -127,7 +129,7 @@ pub struct AudioStats {
 }
 
 pub struct AudioEngine {
-    pub device_name: String,
+    pub device_name_shared: Arc<ArcSwap<String>>,
     pub frame_rx: Receiver<BarFrame>,
     pub settings: Arc<ArcSwap<AudioSettings>>,
     pub stats: Arc<AudioStats>,
@@ -142,11 +144,11 @@ impl AudioEngine {
         let settings = Arc::new(ArcSwap::from_pointee(initial));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(AudioStats::default());
+        let device_name_shared = Arc::new(ArcSwap::from_pointee("Unknown".to_string()));
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
         let (sample_tx, sample_rx) = crossbeam_channel::bounded::<(Vec<f32>, Instant)>(32);
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded::<ControlMsg>();
-        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
         let (tap_tx, tap_rx) = crossbeam_channel::unbounded::<Instant>();
 
         let sample_rate_shared = Arc::new(AtomicU32::new(48_000f32.to_bits()));
@@ -156,14 +158,11 @@ impl AudioEngine {
             let stop = stop.clone();
             let sr = sample_rate_shared.clone();
             let stats = stats.clone();
+            let name_shared = device_name_shared.clone();
             thread::spawn(move || {
-                capture_loop(settings, sample_tx, ctrl_tx, info_tx, sr, stats, stop);
+                capture_loop(settings, sample_tx, ctrl_tx, sr, name_shared, stats, stop);
             });
         }
-
-        let (device_name, sample_rate) = info_rx.recv()
-            .unwrap_or_else(|_| ("Unknown".to_string(), 48000.0));
-        sample_rate_shared.store(sample_rate.to_bits(), Ordering::Relaxed);
 
         {
             let settings = settings.clone();
@@ -178,12 +177,11 @@ impl AudioEngine {
             });
         }
 
-        Self { device_name, frame_rx, settings, stats, tap_tx, stop }
+        Self { device_name_shared, frame_rx, settings, stats, tap_tx, stop }
     }
 
     pub fn shutdown(&self) { self.stop.store(true, Ordering::Relaxed); }
 
-    /// Register a tap (for tap-tempo). Call once per physical tap.
     pub fn tap(&self) {
         let _ = self.tap_tx.try_send(Instant::now());
     }
@@ -205,23 +203,28 @@ fn capture_loop(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_tx: Sender<(Vec<f32>, Instant)>,
     ctrl_tx: Sender<ControlMsg>,
-    info_tx: Sender<(String, f32)>,
     sample_rate_shared: Arc<AtomicU32>,
+    device_name_shared: Arc<ArcSwap<String>>,
     stats: Arc<AudioStats>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = initialize_mta();
-    let mut sent_info = false;
     let mut backoff = Duration::from_millis(500);
 
     loop {
         if stop.load(Ordering::Relaxed) { return; }
+        let session_start = Instant::now();
         match capture_session(
-            &settings, &sample_tx, &ctrl_tx, &info_tx,
-            &sample_rate_shared, &stats, &stop, &mut sent_info,
+            &settings, &sample_tx, &ctrl_tx,
+            &sample_rate_shared, &device_name_shared, &stats, &stop,
         ) {
             SessionEnd::Stopped | SessionEnd::Disconnected => return,
             SessionEnd::Invalidated => {
+                // If the previous session ran for at least 2 seconds, we had a
+                // healthy stream — reset the backoff instead of compounding it.
+                if session_start.elapsed() >= Duration::from_secs(2) {
+                    backoff = Duration::from_millis(500);
+                }
                 eprintln!("WASAPI: device invalidated, retrying in {:?}", backoff);
                 thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -234,17 +237,15 @@ fn capture_session(
     settings: &Arc<ArcSwap<AudioSettings>>,
     sample_tx: &Sender<(Vec<f32>, Instant)>,
     ctrl_tx: &Sender<ControlMsg>,
-    info_tx: &Sender<(String, f32)>,
     sample_rate_shared: &Arc<AtomicU32>,
+    device_name_shared: &Arc<ArcSwap<String>>,
     stats: &Arc<AudioStats>,
     stop: &Arc<AtomicBool>,
-    sent_info: &mut bool,
 ) -> SessionEnd {
     let device = match get_default_device(&Direction::Render) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("WASAPI: get_default_device failed: {e:?}");
-            if !*sent_info { let _ = info_tx.send(("Unknown".into(), 48_000.0)); }
             return SessionEnd::Invalidated;
         }
     };
@@ -252,17 +253,16 @@ fn capture_session(
         Ok(c) => c,
         Err(e) => {
             eprintln!("WASAPI: get_iaudioclient failed: {e:?}");
-            if !*sent_info { let _ = info_tx.send(("Unknown".into(), 48_000.0)); }
             return SessionEnd::Invalidated;
         }
     };
 
     let device_name = device.get_friendlyname().unwrap_or_else(|_| "Default Device".into());
+    let device_id = device.get_id().unwrap_or_default();
     let format = match audio_client.get_mixformat() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("WASAPI: get_mixformat failed: {e:?}");
-            if !*sent_info { let _ = info_tx.send((device_name, 48_000.0)); }
             return SessionEnd::Invalidated;
         }
     };
@@ -285,7 +285,6 @@ fn capture_session(
         &format, min_time, &Direction::Capture, &ShareMode::Shared, true,
     ) {
         eprintln!("WASAPI: initialize_client failed: {e:?}");
-        if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
         return SessionEnd::Invalidated;
     }
 
@@ -293,7 +292,6 @@ fn capture_session(
         Ok(h) => h,
         Err(e) => {
             eprintln!("WASAPI: set_get_eventhandle failed: {e:?}");
-            if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
             return SessionEnd::Invalidated;
         }
     };
@@ -301,20 +299,15 @@ fn capture_session(
         Ok(c) => c,
         Err(e) => {
             eprintln!("WASAPI: get_audiocaptureclient failed: {e:?}");
-            if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
             return SessionEnd::Invalidated;
         }
     };
     if let Err(e) = audio_client.start_stream() {
         eprintln!("WASAPI: start_stream failed: {e:?}");
-        if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
         return SessionEnd::Invalidated;
     }
 
-    if !*sent_info {
-        let _ = info_tx.send((device_name.clone(), sample_rate));
-        *sent_info = true;
-    }
+    device_name_shared.store(Arc::new(device_name.clone()));
     sample_rate_shared.store(sample_rate.to_bits(), Ordering::Relaxed);
 
     let mut sample_buffer: Vec<f32> = Vec::new();
@@ -327,15 +320,16 @@ fn capture_session(
             return SessionEnd::Stopped;
         }
 
-        // ── auto-follow default device (feature 25) ──
+        // ── auto-follow default device (device ID based) ──
         if last_device_check.elapsed() > DEVICE_POLL_INTERVAL {
             last_device_check = Instant::now();
             if let Ok(current) = get_default_device(&Direction::Render) {
-                let current_name = current.get_friendlyname().unwrap_or_default();
-                if current_name != device_name {
-                    eprintln!("WASAPI: default device changed to '{current_name}'");
-                    let _ = audio_client.stop_stream();
-                    return SessionEnd::Invalidated;
+                if let Ok(current_id) = current.get_id() {
+                    if !device_id.is_empty() && !current_id.is_empty() && current_id != device_id {
+                        eprintln!("WASAPI: default device changed");
+                        let _ = audio_client.stop_stream();
+                        return SessionEnd::Invalidated;
+                    }
                 }
             }
         }
@@ -419,7 +413,7 @@ fn downmix(chunk: &[f32], mode: ChannelMixMode) -> f32 {
             ChannelMixMode::Left => chunk[0],
             ChannelMixMode::Right => chunk[1],
             ChannelMixMode::Side => (chunk[0] - chunk[1]) * 0.5,
-            ChannelMixMode::Mono | ChannelMixMode::Mid => {
+            ChannelMixMode::Mono => {
                 if n == 2 {
                     (chunk[0] + chunk[1]) * 0.5
                 } else {
@@ -577,7 +571,7 @@ fn analysis_loop<F: Fn() + Send + 'static>(
         }
 
         if let Some(frame) = processor.process(&history, &current, dt, last_capture_instant) {
-            if frame.beat {
+            if frame.beat && !frame.beat_predicted {
                 stats.onset_count.fetch_add(1, Ordering::Relaxed);
             }
             let is_zero = frame.values.iter().all(|&v| v == 0.0)
@@ -628,7 +622,6 @@ struct OnsetDetector {
     band_flux_history: [VecDeque<f32>; 3],
     flux_history_total: VecDeque<f32>,
     band_armed: [bool; 3],
-    total_armed: bool,
     last_fire: [Option<f64>; 3],
 }
 
@@ -639,7 +632,6 @@ impl OnsetDetector {
             band_flux_history: [VecDeque::with_capacity(240), VecDeque::with_capacity(240), VecDeque::with_capacity(240)],
             flux_history_total: VecDeque::with_capacity(240),
             band_armed: [true; 3],
-            total_armed: true,
             last_fire: [None; 3],
         }
     }
@@ -649,7 +641,6 @@ impl OnsetDetector {
         for h in &mut self.band_flux_history { h.clear(); }
         self.flux_history_total.clear();
         self.band_armed = [true; 3];
-        self.total_armed = true;
         self.last_fire = [None; 3];
     }
 
@@ -662,6 +653,7 @@ impl OnsetDetector {
         sensitivity: f32,
         threshold_mult: f32,
         time_elapsed: f64,
+        focus: BeatFocusMode,
     ) -> (Onsets, bool) {
         // Bands in Hz: kick 20-150, snare 150-2000, hat 6000-12000
         let band_bins = [
@@ -709,8 +701,10 @@ impl OnsetDetector {
             return (onsets, false);
         }
 
+        // Sensitivity scales the *excess* over 1.0 so the multiplier never
+        // collapses to the implicit 1.05 anti-chatter floor.
         let sens = sensitivity.clamp(0.0, 1.0);
-        let mult = threshold_mult.max(1.0) * (1.0 - sens * 0.5);
+        let mult = 1.0 + (threshold_mult.max(1.0) - 1.0) * (1.0 - sens * 0.5);
         let min_gap = MIN_BEAT_GAP_S;
 
         for b in 0..3 {
@@ -737,14 +731,15 @@ impl OnsetDetector {
 
         let total_avg = self.flux_history_total.iter().sum::<f32>()
             / self.flux_history_total.len() as f32;
-        let total_thr = total_avg * mult;
-        let total_above = total_flux > total_thr && total_flux > total_avg * 1.05;
-        if total_flux < total_thr * 0.9 { self.total_armed = true; }
-        let total_fire = total_above && self.total_armed;
-        if total_fire { self.total_armed = false; }
-
         onsets.flux = (total_flux / total_avg.max(1e-9)).min(4.0) / 4.0;
-        (onsets, total_fire)
+
+        // Beat fire follows the user's chosen band focus.
+        let beat_fire = match focus {
+            BeatFocusMode::Bass => onsets.kick,
+            BeatFocusMode::Mid => onsets.snare,
+            BeatFocusMode::Treble => onsets.hat,
+        };
+        (onsets, beat_fire)
     }
 }
 
@@ -787,6 +782,7 @@ struct AudioProcessor {
     onset_detector: OnsetDetector,
     beat_times: VecDeque<f64>,
     bpm_raw: f32,
+    tap_bpm: f32,
     bpm_multiplier: BpmMultiplier,
     phase: f32,
     beat_envelope: f32,
@@ -810,7 +806,7 @@ struct AudioProcessor {
     last_onsets: Onsets,
     bar_offset_db: Vec<f32>,
     offset_centers: Vec<f32>,
-    offset_params: [f32; 4],
+    offset_params: [f32; 5],
     offset_weighting: u8,
 }
 
@@ -864,6 +860,7 @@ impl AudioProcessor {
             onset_detector: OnsetDetector::new(nyquist),
             beat_times: VecDeque::with_capacity(MAX_BEATS),
             bpm_raw: 0.0,
+            tap_bpm: 0.0,
             bpm_multiplier: BpmMultiplier::Normal,
             phase: 0.0,
             beat_envelope: 0.0,
@@ -886,7 +883,7 @@ impl AudioProcessor {
             last_onsets: Onsets { kick: false, snare: false, hat: false, flux: 0.0 },
             bar_offset_db: Vec::new(),
             offset_centers: Vec::new(),
-            offset_params: [f32::NAN; 4],
+            offset_params: [f32::NAN; 5],
             offset_weighting: u8::MAX,
         }
     }
@@ -909,9 +906,11 @@ impl AudioProcessor {
                 intervals.sort_by(|a, b| a.total_cmp(b));
                 let median = intervals[intervals.len() / 2];
                 if median > 0.15 && median < 2.0 {
-                    self.bpm_raw = (60.0 / median) as f32;
+                    // Store the tap tempo separately; leave bpm_raw alone so
+                    // the detector's own history survives the override.
+                    self.tap_bpm = (60.0 / median) as f32;
                     self.tap_override_until = Some(t);
-                    let period = 60.0 / (self.bpm_raw * self.bpm_multiplier.factor()).max(1.0);
+                    let period = 60.0 / (self.tap_bpm * self.bpm_multiplier.factor()).max(1.0);
                     self.phase = 0.0;
                     self.next_beat_time = self.time_elapsed + period as f64;
                     self.last_fired_beat_time = self.time_elapsed;
@@ -926,7 +925,10 @@ impl AudioProcessor {
             WeightingCurve::AWeighting => 1,
             WeightingCurve::KWeighting => 2,
         };
-        let params = [s.spectrum_tilt, s.eq_bass_db, s.eq_mid_db, s.eq_treble_db];
+        let params = [
+            s.spectrum_tilt, s.eq_bass_db, s.eq_mid_db, s.eq_treble_db,
+            self.sample_rate,
+        ];
         if self.offset_params == params
             && self.offset_weighting == w_id
             && self.offset_centers == self.bin_centers_hz
@@ -946,13 +948,14 @@ impl AudioProcessor {
             let weight_db = match s.weighting {
                 WeightingCurve::None => 0.0,
                 WeightingCurve::AWeighting => a_weighting_db(f),
-                WeightingCurve::KWeighting => k_weighting_db(f),
+                WeightingCurve::KWeighting => k_weighting_db(f, self.sample_rate),
             };
             self.bar_offset_db.push(tilt_db + eq_db + weight_db);
         }
     }
 
     fn update_initial_state(&mut self, s: &AudioSettings) {
+        let mut fft_changed = false;
         if s.fft_size != self.cached_fft_size {
             if !s.fft_size.is_power_of_two() || s.fft_size < 256 { return; }
             let mut planner = RealFftPlanner::new();
@@ -965,13 +968,15 @@ impl AudioProcessor {
             self.window = make_window(s.window_function, s.fft_size);
             self.window_gain = compute_window_gain(&self.window);
             self.onset_detector = OnsetDetector::new(s.fft_size / 2);
+            fft_changed = true;
         } else if s.window_function != self.cached_window_fn {
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
             self.window_gain = compute_window_gain(&self.window);
         }
 
-        if s.num_bars != self.cached_num_bars
+        if fft_changed
+            || s.num_bars != self.cached_num_bars
             || s.frequency_scaling != self.cached_scaling
             || s.min_frequency_hz != self.cached_min_freq
             || s.max_frequency_hz != self.cached_max_freq
@@ -1020,6 +1025,7 @@ impl AudioProcessor {
         self.spectrum_row.fill(0.0);
         self.beat_times.clear();
         self.bpm_raw = 0.0;
+        self.tap_bpm = 0.0;
         self.next_beat_time = f64::INFINITY;
         self.tap_override_until = None;
         self.tap_times.clear();
@@ -1058,7 +1064,17 @@ impl AudioProcessor {
         self.frame_ring_count = 0;
     }
 
-    fn effective_bpm(&self) -> f32 { self.bpm_raw * self.bpm_multiplier.factor() }
+    fn effective_bpm(&self) -> f32 {
+        let bpm = if self.tap_override_until
+            .map(|u| u.elapsed() < Duration::from_secs(5))
+            .unwrap_or(false) && self.tap_bpm > 20.0
+        {
+            self.tap_bpm
+        } else {
+            self.bpm_raw
+        };
+        bpm * self.bpm_multiplier.factor()
+    }
 
     fn process(
         &mut self,
@@ -1074,13 +1090,15 @@ impl AudioProcessor {
 
         let n_fft = self.cached_fft_size;
         if history.len() < n_fft {
+            // Emit a static frame with cleared onsets — no fresh analysis
+            // happened this tick, so the previous flags are stale.
             return Some(BarFrame {
                 values: self.bar_values.clone(),
                 peaks: self.bar_peaks.clone(),
                 beat: false, beat_predicted: false,
                 beat_envelope: self.beat_envelope, beat_in: self.beat_in,
                 bpm: self.effective_bpm(), phase: self.phase,
-                onsets: self.last_onsets.clone(),
+                onsets: Onsets { kick: false, snare: false, hat: false, flux: 0.0 },
                 rms: self.last_rms, peak: self.last_peak,
                 band_levels: self.band_levels,
                 chroma: self.chroma,
@@ -1137,14 +1155,21 @@ impl AudioProcessor {
         let norm = self.window_gain * user_gain;
         let bin_width = self.sample_rate / n_fft as f32;
 
+        // Band levels: skip the DC bin and average in dB so treble isn't
+        // dwarfed by broadband bass energy. Mapped to [0, 1] over [-100, 0] dB.
         let band_hz = [(20.0, 100.0), (100.0, 500.0), (500.0, 2000.0), (2000.0, 8000.0)];
         for (b, (lo_hz, hi_hz)) in band_hz.iter().enumerate() {
-            let lo = ((lo_hz / bin_width) as usize).min(nyquist);
+            let lo = ((lo_hz / bin_width) as usize).min(nyquist).max(1);
             let hi = ((hi_hz / bin_width).ceil() as usize).min(nyquist);
-            let mut sum = 0.0f32;
-            for k in lo..hi.max(lo + 1) { sum += self.output_buffer[k].norm(); }
-            let count = (hi - lo).max(1) as f32;
-            self.band_levels[b] = ((sum / count) * norm).max(0.0).min(1.0);
+            let mut sum_db = 0.0f32;
+            let mut count = 0usize;
+            for k in lo..hi.max(lo + 1) {
+                let mag = self.output_buffer[k].norm() * norm;
+                sum_db += 20.0 * mag.max(1e-9).log10();
+                count += 1;
+            }
+            let avg_db = sum_db / count.max(1) as f32;
+            self.band_levels[b] = ((avg_db + 100.0) / 100.0).clamp(0.0, 1.0);
         }
 
         for i in 0..SPECTRUM_ROW_LEN {
@@ -1156,7 +1181,7 @@ impl AudioProcessor {
         }
 
         if self.chroma_enabled {
-            self.compute_chroma_and_pitch(bin_width, nyquist);
+            self.compute_chroma_and_pitch(bin_width, nyquist, norm);
         } else {
             self.chroma = [0.0; 12];
             self.dominant_pitch_hz = 0.0;
@@ -1194,7 +1219,7 @@ impl AudioProcessor {
             self.raw_bars.copy_from_slice(&self.tmp_bars);
         }
 
-        if s.harmonic_emphasis && num_bars >= 5 {
+        if s.peak_bloom && num_bars >= 5 {
             self.bloom_bars.copy_from_slice(&self.raw_bars);
             for i in 2..num_bars - 2 {
                 let c = self.raw_bars[i];
@@ -1279,25 +1304,47 @@ impl AudioProcessor {
         })
     }
 
-    fn compute_chroma_and_pitch(&mut self, bin_width: f32, nyquist: usize) {
+    fn compute_chroma_and_pitch(&mut self, bin_width: f32, nyquist: usize, norm: f32) {
         let mut chroma = [0.0f32; 12];
         let mut best_mag = 0.0f32;
         let mut best_bin = 0usize;
+        // Below ~200 Hz a 2048-point FFT can't resolve semitones; skip those
+        // bins instead of smearing them into the wrong pitch class.
+        const MIN_HZ: f32 = 200.0;
+        const MAX_HZ: f32 = 4000.0;
         for k in 1..nyquist {
             let freq = k as f32 * bin_width;
-            if freq < 80.0 || freq > 4000.0 { continue; }
-            let mag = self.output_buffer[k].norm();
-            if mag < 1e-6 { continue; }
+            if freq < MIN_HZ || freq > MAX_HZ { continue; }
+            let lin_mag = self.output_buffer[k].norm() * norm;
+            if lin_mag < 1e-7 { continue; }
+            // Accumulate in the dB domain so dense treble bins don't swamp
+            // the sparse bass bins.
+            let db = 20.0 * lin_mag.max(1e-9).log10();
+            let weight = (db + 100.0).max(0.0);
             let midi = 69.0 + 12.0 * (freq / 440.0).log2();
             let pc = ((midi.round() as i32).rem_euclid(12)) as usize;
-            chroma[pc] += mag;
-            if mag > best_mag { best_mag = mag; best_bin = k; }
+            chroma[pc] += weight;
+            if lin_mag > best_mag { best_mag = lin_mag; best_bin = k; }
         }
         let max = chroma.iter().cloned().fold(0.0f32, f32::max);
-        if max > 1e-6 { for v in chroma.iter_mut() { *v /= max; } }
+        if max > 1e-6 {
+            for v in chroma.iter_mut() { *v /= max; }
+        }
         self.chroma = chroma;
-        if best_mag > 1e-5 && best_bin > 0 {
-            let freq = best_bin as f32 * bin_width;
+
+        if best_mag > 1e-5 && best_bin >= 1 && best_bin + 1 < nyquist {
+            // Parabolic interpolation on log magnitude so the dominant pitch
+            // lands between bins instead of snapping to the nearest FFT bin.
+            let a_l = self.output_buffer[best_bin - 1].norm().max(1e-12).ln();
+            let b_l = self.output_buffer[best_bin].norm().max(1e-12).ln();
+            let c_l = self.output_buffer[best_bin + 1].norm().max(1e-12).ln();
+            let denom = a_l - 2.0 * b_l + c_l;
+            let offset = if denom.abs() > 1e-9 {
+                (0.5 * (a_l - c_l) / denom).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            let freq = (best_bin as f32 + offset) * bin_width;
             self.dominant_pitch_hz = freq;
             self.dominant_pitch_midi = 69.0 + 12.0 * (freq / 440.0).log2();
         } else {
@@ -1370,23 +1417,20 @@ impl AudioProcessor {
         let mut mags = vec![0.0f32; nyquist];
         for k in 1..nyquist { mags[k] = self.output_buffer[k].norm(); }
 
-        let (onsets, any_fire) = self.onset_detector.detect(
+        let (onsets, beat_fire) = self.onset_detector.detect(
             &mags, nyquist, bin_width,
             s.poll_rate_hz,
             s.beat_detection_sensitivity,
             s.onset_threshold_multiplier,
             self.time_elapsed,
+            s.beat_focus,
         );
-
-        let in_tap_override = self.tap_override_until
-            .map(|u| u.elapsed() < Duration::from_secs(5))
-            .unwrap_or(false);
 
         let since_last_real = self.time_elapsed
             - self.beat_times.back().copied().unwrap_or(f64::NEG_INFINITY);
-        let is_real_beat = any_fire
-            && !in_tap_override
-            && since_last_real > MIN_BEAT_GAP_S;
+        // Real detection runs even during a tap-tempo override, so
+        // beat_times doesn't go stale and clear right when the override ends.
+        let is_real_beat = beat_fire && since_last_real > MIN_BEAT_GAP_S;
 
         if is_real_beat {
             self.beat_times.push_back(self.time_elapsed);
@@ -1397,9 +1441,10 @@ impl AudioProcessor {
             if self.time_elapsed - t > BEAT_MEMORY_S { self.beat_times.pop_front(); } else { break; }
         }
         if let Some(&last) = self.beat_times.back() {
-            if self.time_elapsed - last > BEAT_TIMEOUT_S && !in_tap_override {
+            if self.time_elapsed - last > BEAT_TIMEOUT_S {
                 self.beat_times.clear();
-                self.bpm_raw = 0.0;
+                // Keep bpm_raw: a brief silence (or a tap override just ending)
+                // shouldn't drop us back to "no tempo".
             }
         }
 
@@ -1411,14 +1456,19 @@ impl AudioProcessor {
             let period_s = if eff_bpm > 20.0 { 60.0 / eff_bpm } else { 0.5 };
             let phase_error = if self.phase < 0.5 { self.phase } else { 1.0 - self.phase };
             let on_beat = phase_error < 0.35;
-            if on_beat && s.bpm_lock_enabled {
-                let error = if self.phase < 0.5 { -self.phase } else { 1.0 - self.phase };
-                self.phase = (self.phase + error * s.bpm_phase_smoothing.clamp(0.0, 1.0))
-                    .rem_euclid(1.0);
+            if eff_bpm > 20.0 {
+                if s.bpm_lock_enabled {
+                    if on_beat {
+                        let error = if self.phase < 0.5 { -self.phase } else { 1.0 - self.phase };
+                        self.phase = (self.phase + error * s.bpm_phase_smoothing.clamp(0.0, 1.0))
+                            .rem_euclid(1.0);
+                    }
+                } else {
+                    self.phase = 0.0;
+                }
             }
             self.last_fired_beat_time = self.time_elapsed;
             self.next_beat_time = self.time_elapsed + period_s as f64;
-            if eff_bpm > 20.0 { self.phase = 0.0; }
             fire_real = true;
         }
 
@@ -1428,17 +1478,25 @@ impl AudioProcessor {
             self.phase = (self.phase + dt / period_s).rem_euclid(1.0);
 
             let now = self.time_elapsed;
+            // Resync if we've drifted more than 2 periods behind (e.g. after a
+            // long silence or after a tap-tempo override).
+            if self.next_beat_time + 2.0 * period_s as f64 < now {
+                self.next_beat_time = now + period_s as f64;
+            }
+
             let grace = 0.08;
-            if !fire_real && now > self.next_beat_time + grace {
+            // Predicted beats are the phase-lock feature — gate on the lock.
+            if s.bpm_lock_enabled && !fire_real && now > self.next_beat_time + grace {
                 let since_fired = now - self.last_fired_beat_time;
                 if since_fired > period_s as f64 * 0.6 {
                     fire_predicted = true;
                     self.last_fired_beat_time = now;
-                    self.next_beat_time = now + period_s as f64;
-                    self.phase = 0.0;
-                } else {
-                    self.next_beat_time = now + period_s as f64;
                 }
+                // Advance by exactly one period so predictions don't drift.
+                // Do NOT reset phase here — it wraps on its own via the
+                // += dt / period step above, and a second reset would wrap
+                // twice per beat.
+                self.next_beat_time += period_s as f64;
             }
             self.beat_in = (1.0 - self.phase) * period_s - s.latency_offset_ms / 1000.0;
         } else {
@@ -1529,11 +1587,8 @@ fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     w
 }
 
-/// Mel conversion: 2595 * log10(1 + f/700)
 fn hz_to_mel(f: f32) -> f32 { 2595.0 * (1.0 + f / 700.0).log10() }
 fn mel_to_hz(m: f32) -> f32 { 700.0 * (10f32.powf(m / 2595.0) - 1.0) }
-
-/// Bark approximation (Traunmüller): 26.81 * f / (1960 + f) - 0.53
 fn hz_to_bark(f: f32) -> f32 { 26.81 * f / (1960.0 + f) - 0.53 }
 fn bark_to_hz(z: f32) -> f32 {
     let z = z + 0.53;
@@ -1659,12 +1714,50 @@ fn biquad_db(f: f32, fs: f32, b: [f32; 3], a: [f32; 3]) -> f32 {
     10.0 * (num / den).log10()
 }
 
-fn k_weighting_db(f: f32) -> f32 {
-    const FS: f32 = 48_000.0;
-    let shelf = biquad_db(f, FS,
-        [1.535_124_86, -2.691_696_19, 1.198_392_81],
-        [1.0, -1.690_659_29, 0.732_480_77]);
-    let hp = biquad_db(f, FS, [1.0, -2.0, 1.0], [1.0, -1.990_047_45, 0.990_072_25]);
+/// RBJ high-shelf (S = 1) magnitude in dB at frequency `f`, designed for `fs`.
+fn shelf_db(f: f32, fs: f32, f0: f32, gain_db: f32, q: f32) -> f32 {
+    let _ = q; // shelf slope is fixed at S = 1 in this derivation
+    let a = 10.0f32.powf(gain_db / 40.0);
+    let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
+    let cos_w0 = w0.cos();
+    let sin_w0 = w0.sin();
+    let alpha = sin_w0 / 2.0 * std::f32::consts::SQRT_2;
+    let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+    let b0 =  a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
+    let b2 =  a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha);
+    let a0 =  (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+    let a1 =  2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
+    let a2 =  (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
+    biquad_db(f, fs, [b0, b1, b2], [a0, a1, a2])
+}
+
+/// RBJ high-pass magnitude in dB at frequency `f`, designed for `fs`.
+fn hp_db(f: f32, fs: f32, f0: f32, q: f32) -> f32 {
+    let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
+    let cos_w0 = w0.cos();
+    let sin_w0 = w0.sin();
+    let alpha = sin_w0 / (2.0 * q);
+    let b0 = (1.0 + cos_w0) / 2.0;
+    let b1 = -(1.0 + cos_w0);
+    let b2 = (1.0 + cos_w0) / 2.0;
+    let a0 = 1.0 + alpha;
+    let a1 = -2.0 * cos_w0;
+    let a2 = 1.0 - alpha;
+    biquad_db(f, fs, [b0, b1, b2], [a0, a1, a2])
+}
+
+/// ITU-R BS.1770 K-weighting, re-derived via RBJ biquads at `fs`. The
+/// hardcoded coefficients in the spec are valid only at 48 kHz.
+fn k_weighting_db(f: f32, fs: f32) -> f32 {
+    const SHELF_F0: f32 = 1681.974450955533;
+    const SHELF_GAIN_DB: f32 = 3.999843853973347;
+    const SHELF_Q: f32 = 0.7071752369554196;
+    const HP_F0: f32 = 38.13547087602444;
+    const HP_Q: f32 = 0.5003270373238773;
+    let shelf = shelf_db(f, fs, SHELF_F0, SHELF_GAIN_DB, SHELF_Q);
+    let hp = hp_db(f, fs, HP_F0, HP_Q);
     shelf + hp
 }
 
@@ -1711,6 +1804,26 @@ mod tests {
     }
 
     #[test]
+    fn fft_size_change_rebuilds_bin_ranges() {
+        let mut p = AudioProcessor::new(48000.0);
+        let mut s = AudioSettings::default();
+        s.num_bars = 64;
+
+        s.fft_size = 1024;
+        p.update_initial_state(&s);
+        let max_bin_1024 = p.bin_ranges.iter().map(|&(_, e)| e).max().unwrap();
+
+        s.fft_size = 4096;
+        p.update_initial_state(&s);
+        let max_bin_4096 = p.bin_ranges.iter().map(|&(_, e)| e).max().unwrap();
+
+        // 4× larger FFT → 4× more bins; if the ranges weren't rebuilt they
+        // would still cap at the 1024-point Nyquist.
+        assert!(max_bin_4096 > max_bin_1024 * 3,
+            "bin ranges did not track FFT size (1024→{max_bin_1024}, 4096→{max_bin_4096})");
+    }
+
+    #[test]
     fn bar_centers_log_ratio_is_constant() {
         let c = compute_bar_centers_hz(20, FrequencyScaling::Logarithmic, 30.0, 16000.0);
         let r0 = c[1] / c[0];
@@ -1733,16 +1846,21 @@ mod tests {
     }
 
     #[test]
-    fn k_weighting_is_bounded() {
-        let db = k_weighting_db(1000.0);
-        assert!(db.abs() < 5.0, "K at 1 kHz = {db}");
+    fn k_weighting_1khz_is_bounded_at_48k() {
+        let db = k_weighting_db(1000.0, 48_000.0);
+        assert!(db.abs() < 5.0, "K at 1 kHz / 48 k = {db}");
+    }
+
+    #[test]
+    fn k_weighting_1khz_is_bounded_at_44_1k() {
+        let db = k_weighting_db(1000.0, 44_100.0);
+        assert!(db.abs() < 5.0, "K at 1 kHz / 44.1 k = {db}");
     }
 
     #[test]
     fn downmix_mono_of_identical_is_identity() {
         let chunk = [0.5f32, 0.5];
         assert!((downmix(&chunk, ChannelMixMode::Mono) - 0.5).abs() < 1e-6);
-        assert!((downmix(&chunk, ChannelMixMode::Mid) - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -1845,6 +1963,7 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i).unwrap();
         let peak_hz = compute_bar_centers_hz(64, FrequencyScaling::Logarithmic, 30.0, 16000.0)[peak_i];
-        assert!((peak_hz - freq).abs() / freq < 0.5, "peak at {peak_hz} Hz, expected ~{freq}");
+        // ±15% ≈ one log-spaced bar at 64 bars from 30–16 000 Hz.
+        assert!((peak_hz - freq).abs() / freq < 0.15, "peak at {peak_hz} Hz, expected ~{freq}");
     }
 }
