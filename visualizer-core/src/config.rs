@@ -1,3 +1,7 @@
+// ═══════════════════════════════════════════════════════════════
+// config.rs  —  full file
+// ═══════════════════════════════════════════════════════════════
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -53,7 +57,7 @@ pub const DEFAULT_DC_BLOCK:                bool  = true;
 pub const DEFAULT_PER_BAND_BALLISTICS:     bool  = false;
 pub const DEFAULT_PER_FRAME_NORMALIZATION: bool  = false;
 pub const DEFAULT_BEAT_ENVELOPE_DECAY_MS:  f32   = 120.0;
-pub const DEFAULT_HARMONIC_EMPHASIS:       bool  = false;
+pub const DEFAULT_PEAK_BLOOM:              bool  = false;
 
 // ─────────────────────────────────────────────────────────────
 // Visualizer primitives
@@ -439,7 +443,14 @@ impl DecayMode {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ChannelMixMode { Mono, Left, Right, Mid, Side }
+pub enum ChannelMixMode {
+    /// Mono downmix of the (stereo or surround) signal.
+    /// Historical `Mid` deserializes here for backwards compatibility.
+    #[serde(alias = "Mid")] Mono,
+    Left,
+    Right,
+    Side,
+}
 impl Default for ChannelMixMode { fn default() -> Self { ChannelMixMode::Mono } }
 impl ChannelMixMode {
     pub fn display_name(self) -> &'static str {
@@ -447,7 +458,6 @@ impl ChannelMixMode {
             ChannelMixMode::Mono => "Mono (L+R)",
             ChannelMixMode::Left => "Left Channel",
             ChannelMixMode::Right => "Right Channel",
-            ChannelMixMode::Mid => "Mid (Centered)",
             ChannelMixMode::Side => "Side (Stereo Width)",
         }
     }
@@ -456,12 +466,11 @@ impl ChannelMixMode {
             ChannelMixMode::Mono => "Standard L+R mix. Best for balanced visualizers.",
             ChannelMixMode::Left => "Only uses the left channel. Useful for checking stereo panning.",
             ChannelMixMode::Right => "Only uses the right channel.",
-            ChannelMixMode::Mid => "Extracts the center (L+R). Highlights vocals and kick drums.",
             ChannelMixMode::Side => "Extracts the stereo width (L-R). Highlights reverbs and wide synths.",
         }
     }
-    pub fn all() -> [ChannelMixMode; 5] {
-        [ChannelMixMode::Mono, ChannelMixMode::Left, ChannelMixMode::Right, ChannelMixMode::Mid, ChannelMixMode::Side]
+    pub fn all() -> [ChannelMixMode; 4] {
+        [ChannelMixMode::Mono, ChannelMixMode::Left, ChannelMixMode::Right, ChannelMixMode::Side]
     }
 }
 
@@ -567,7 +576,8 @@ pub struct AudioSettings {
     #[serde(default)]                                  pub weighting: WeightingCurve,
     #[serde(default = "default_dc_block")]             pub dc_block: bool,
     #[serde(default = "default_freq_smoothing")]       pub frequency_smoothing: f32,
-    #[serde(default = "default_harmonic_emphasis")]    pub harmonic_emphasis: bool,
+    #[serde(default = "default_peak_bloom", alias = "harmonic_emphasis")]
+                                                       pub peak_bloom: bool,
 
     // Amplitude / dynamics
     #[serde(default = "default_sensitivity")]          pub sensitivity: f32,
@@ -621,6 +631,18 @@ pub struct AudioSettings {
     #[serde(default = "default_chroma_enabled")]       pub chroma_enabled: bool,
 }
 
+impl AudioSettings {
+    /// Fields a preset must never overwrite when applied — these are
+    /// considered owned by the user's session, not by the preset's genre.
+    fn preserve_user_fields_from(&mut self, other: &AudioSettings) {
+        self.num_bars = other.num_bars;
+        self.channel_mix = other.channel_mix;
+        self.latency_offset_ms = other.latency_offset_ms;
+        self.raw_gain = other.raw_gain;
+        self.poll_rate_hz = other.poll_rate_hz;
+    }
+}
+
 fn default_fft_size() -> usize { DEFAULT_FFT_SIZE }
 fn default_num_bars() -> usize { DEFAULT_NUM_BARS }
 fn default_min_freq() -> f32 { DEFAULT_MIN_FREQ }
@@ -653,7 +675,7 @@ fn default_dc_block() -> bool { DEFAULT_DC_BLOCK }
 fn default_per_band_ballistics() -> bool { DEFAULT_PER_BAND_BALLISTICS }
 fn default_per_frame_normalization() -> bool { DEFAULT_PER_FRAME_NORMALIZATION }
 fn default_beat_envelope_decay() -> f32 { DEFAULT_BEAT_ENVELOPE_DECAY_MS }
-fn default_harmonic_emphasis() -> bool { DEFAULT_HARMONIC_EMPHASIS }
+fn default_peak_bloom() -> bool { DEFAULT_PEAK_BLOOM }
 fn default_latency_offset_ms() -> f32 { 0.0 }
 fn default_chroma_enabled() -> bool { true }
 
@@ -665,7 +687,7 @@ impl Default for AudioSettings {
             min_frequency_hz: DEFAULT_MIN_FREQ, max_frequency_hz: DEFAULT_MAX_FREQ,
             channel_mix: ChannelMixMode::default(), weighting: WeightingCurve::default(),
             dc_block: DEFAULT_DC_BLOCK, frequency_smoothing: DEFAULT_FREQ_SMOOTHING,
-            harmonic_emphasis: DEFAULT_HARMONIC_EMPHASIS,
+            peak_bloom: DEFAULT_PEAK_BLOOM,
 
             sensitivity: DEFAULT_SENSITIVITY, raw_gain: DEFAULT_RAW_GAIN,
             response_gamma: DEFAULT_RESPONSE_GAMMA, noise_gate: DEFAULT_NOISE_GATE,
@@ -710,11 +732,6 @@ pub enum AudioPreset {
     LoFi, Metal, Country, RnB, Vocal, Podcast,
 }
 
-/// Audio-core v1 gain compensation adds back the coherent gain that the old
-/// rectangular-assumed normalization was throwing away. These are how much
-/// louder (in dB) a fixed input signal now reads than it did before, per
-/// window. Used both to seed the built-in presets and to migrate saved
-/// configs so existing users don't see a sudden 6 dB jump.
 fn window_db_shift(w: WindowFunction) -> f32 {
     match w {
         WindowFunction::Rectangular    => 0.0,
@@ -764,12 +781,12 @@ impl AudioPreset {
             AudioPreset::Classical => "Preserves dynamic range (AGC off), softer attack, long decay, clean tones.",
             AudioPreset::Piano => "Clean tone with sustain, good for solo piano and acoustic material.",
             AudioPreset::Jazz => "Warm and smooth, gentler response curve and longer decay.",
-            AudioPreset::Ambient => "Slow and flowing, heavy smoothing, soft attack.",
+            AudioPreset::Ambient => "Slow and flowing, heavy smoothing, soft attack. AGC off so the track's own dynamics come through.",
             AudioPreset::LoFi => "Soft, warm, and slow. Long smoothing window and rolled-off highs for a mellow look.",
             AudioPreset::Metal => "Aggressive and punchy. Fast attack, wide dynamic range, mid-forward.",
             AudioPreset::Country => "Clean and dynamic. Balanced mids with moderate smoothing.",
             AudioPreset::RnB => "Smooth bass emphasis with vocal presence. Sweet spot between Pop and Hip-hop.",
-            AudioPreset::Vocal => "Mid-focused and voice-oriented. Narrow band, longer decay, gentle comp.",
+            AudioPreset::Vocal => "Mid-focused and voice-oriented. Narrow band and longer decay for legato passages.",
             AudioPreset::Podcast => "Narrow speech band with heavy smoothing, clean and steady.",
         }
     }
@@ -780,10 +797,12 @@ impl AudioPreset {
 
             AudioPreset::Pop => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hann,
-                sensitivity: 55.0, response_gamma: 1.8, spectrum_tilt: 1.5,
+                sensitivity: 55.0, response_gamma: 1.8,
+                spectrum_tilt: 3.0,
                 target_dynamic_range_db: 55.0, decay_time_ms: 200.0,
                 decay_mode: DecayMode::Exponential, average_size: 2,
                 beat_detection_sensitivity: 0.6, onset_threshold_multiplier: 1.4,
+                eq_treble_db: 1.5,
                 ..d
             },
             AudioPreset::Rock => AudioSettings {
@@ -797,8 +816,10 @@ impl AudioPreset {
                 eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Electronic => AudioSettings {
-                fft_size: 1024, window_function: WindowFunction::Hann,
-                sensitivity: 60.0, response_gamma: 2.0, spectrum_tilt: 1.5,
+                fft_size: 2048,
+                window_function: WindowFunction::Hann,
+                sensitivity: 60.0, response_gamma: 1.7,
+                spectrum_tilt: 1.5,
                 target_dynamic_range_db: 50.0, attack_time_ms: 0.0,
                 decay_time_ms: 150.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
@@ -806,7 +827,8 @@ impl AudioPreset {
                 eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass, ..d
             },
             AudioPreset::HipHop => AudioSettings {
-                fft_size: 1024, window_function: WindowFunction::Hann,
+                fft_size: 2048,
+                window_function: WindowFunction::Hann,
                 sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 1.0,
                 target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
                 decay_time_ms: 250.0, decay_mode: DecayMode::Gravity,
@@ -832,7 +854,7 @@ impl AudioPreset {
                 average_size: 2, beat_detection_sensitivity: 0.35,
                 onset_threshold_multiplier: 1.6,
                 max_frequency_hz: 5000.0, eq_mid_db: 1.0,
-                harmonic_emphasis: true,
+                peak_bloom: true,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Jazz => AudioSettings {
@@ -849,7 +871,9 @@ impl AudioPreset {
                 sensitivity: 70.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 attack_time_ms: 40.0, decay_time_ms: 800.0, decay_mode: DecayMode::Exponential,
                 average_size: 6, beat_detection_sensitivity: 0.3,
-                onset_threshold_multiplier: 1.8, ..d
+                onset_threshold_multiplier: 1.8,
+                agc_enabled: false,
+                ..d
             },
 
             AudioPreset::LoFi => AudioSettings {
@@ -860,17 +884,18 @@ impl AudioPreset {
                 decay_mode: DecayMode::Exponential,
                 average_size: 4, beat_detection_sensitivity: 0.35,
                 onset_threshold_multiplier: 1.6, chroma_enabled: false,
-                eq_treble_db: -1.0,
+                max_frequency_hz: 10_000.0,
+                eq_treble_db: -4.0,
                 beat_focus: BeatFocusMode::Bass, ..d
             },
             AudioPreset::Metal => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
-                min_decibels: -90.0, max_decibels: -23.0, target_dynamic_range_db: 55.0,
-                sensitivity: 60.0, response_gamma: 1.9, spectrum_tilt: 1.0,
+                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 55.0,
+                sensitivity: 60.0, response_gamma: 1.5, spectrum_tilt: 1.0,
                 attack_time_ms: 1.0, decay_time_ms: 180.0,
                 decay_mode: DecayMode::Exponential,
                 average_size: 1, beat_detection_sensitivity: 0.7,
-                onset_threshold_multiplier: 1.4, eq_mid_db: 2.5, eq_treble_db: 1.0,
+                onset_threshold_multiplier: 1.6, eq_mid_db: 2.5, eq_treble_db: 1.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Country => AudioSettings {
@@ -898,28 +923,38 @@ impl AudioPreset {
                 sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0,
                 average_size: 3, beat_detection_sensitivity: 0.3,
-                onset_threshold_multiplier: 1.8, chroma_enabled: false,
+                onset_threshold_multiplier: 1.8,
+                chroma_enabled: true,
                 eq_bass_db: -3.0, eq_mid_db: 2.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Podcast => AudioSettings {
-                fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
+                fft_size: 2048,
+                window_function: WindowFunction::BlackmanHarris,
                 min_frequency_hz: 100.0, max_frequency_hz: 6000.0,
                 min_decibels: -104.0, max_decibels: -29.0, target_dynamic_range_db: 70.0,
                 sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.0,
-                attack_time_ms: 20.0, decay_time_ms: 600.0,
+                attack_time_ms: 8.0,
+                decay_time_ms: 600.0,
                 decay_mode: DecayMode::Exponential,
-                average_size: 4, beat_detection_sensitivity: 0.15,
+                average_size: 3,
+                beat_detection_sensitivity: 0.15,
                 onset_threshold_multiplier: 2.0, chroma_enabled: false,
                 eq_bass_db: -4.0, eq_mid_db: 2.5, eq_treble_db: -1.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
         }
     }
-    pub fn apply(self, s: &mut AudioSettings) { *s = self.settings(); }
+    pub fn apply(self, s: &mut AudioSettings) {
+        let mut new = self.settings();
+        new.preserve_user_fields_from(s);
+        *s = new;
+    }
     pub fn detect(s: &AudioSettings) -> Option<AudioPreset> {
         for p in Self::all() {
-            if p.settings() == *s { return Some(p); }
+            let mut candidate = p.settings();
+            candidate.preserve_user_fields_from(s);
+            if candidate == *s { return Some(p); }
         }
         None
     }
@@ -1158,8 +1193,6 @@ pub struct AppConfig {
     #[serde(default)] pub audio: AudioSettings,
     #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
 
-    // Schema version — 0 or missing = pre-v1 (pre window-gain compensation),
-    // 1 = post window-gain, 2 = post beat-engine / chroma / diagnostics.
     #[serde(default)] pub config_version: u32,
 
     // Legacy migration fields (kept for old configs; consumed during load())
@@ -1266,9 +1299,6 @@ impl AppConfig {
         self.color_change_presets = new_ccp;
     }
 
-    /// One-shot migration so persisted settings still look the same after the
-    /// audio-core window-gain correction (v0 → v1) and the beat-engine / chroma
-    /// upgrade (v1 → v2). Returns `true` if anything changed.
     fn migrate(&mut self) -> bool {
         let mut changed = false;
 
@@ -1287,7 +1317,6 @@ impl AppConfig {
             changed = true;
         }
 
-        // v1 → v2: fields are all serde-defaulted, no data reshape needed.
         if self.config_version < 2 {
             self.config_version = 2;
             changed = true;
@@ -1300,7 +1329,6 @@ impl AppConfig {
         let path = Self::get_path();
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
-                // ── legacy field migration (pre-audio-core) ──
                 if let Some(c) = config.bar_color.take() {
                     config.static_single_source = ColorSource::Static(vec![c]);
                 }
