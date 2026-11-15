@@ -745,7 +745,7 @@ struct VisualizerApp {
     audio_rx: crossbeam_channel::Receiver<BarFrame>,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
     audio_stats: Arc<AudioStats>,
-    audio_device_name: String,
+    audio_device_name: std::sync::Arc<arc_swap::ArcSwap<String>>,
     tap_tx: crossbeam_channel::Sender<Instant>,
 
     // Two-frame interpolation state (feature 23)
@@ -811,7 +811,7 @@ impl VisualizerApp {
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
         let audio_stats = engine.stats.clone();
-        let audio_device_name = engine.device_name.clone();
+        let audio_device_name = engine.device_name_shared.clone();
         let tap_tx = engine.tap_sender();
 
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
@@ -3618,9 +3618,9 @@ impl SettingsState {
 
         checkbox_reset(
             ui,
-            &mut a.harmonic_emphasis,
-            "Harmonic Emphasis",
-            DEFAULT_HARMONIC_EMPHASIS,
+            &mut a.peak_bloom,
+            "Peak Bloom",
+            DEFAULT_PEAK_BLOOM,
         );
         help_text(
             ui,
@@ -4467,7 +4467,7 @@ impl VisualizerApp {
             .frame(frame)
             .show(ctx, |ui| {
                 egui::Grid::new("diag_grid").num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label("Device:"); ui.label(&self.audio_device_name); ui.end_row();
+                    ui.label("Device:"); ui.label(self.audio_device_name.load().as_str()); ui.end_row();
                     ui.label("Sample rate:"); ui.label(format!("{:.0} Hz", sr)); ui.end_row();
                     ui.label("Channels:"); ui.label(format!("{}", stats.channels.load(Ordering::Relaxed))); ui.end_row();
                     ui.label("Bits/sample:"); ui.label(format!("{}", stats.bits_per_sample.load(Ordering::Relaxed))); ui.end_row();
