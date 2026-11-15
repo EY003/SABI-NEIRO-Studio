@@ -1480,7 +1480,7 @@ impl AudioProcessor {
             let now = self.time_elapsed;
             // Resync if we've drifted more than 2 periods behind (e.g. after a
             // long silence or after a tap-tempo override).
-            if self.next_beat_time + 2.0 * period_s as f64 < now {
+            if self.next_beat_time + 2.0 * (period_s as f64) < now {
                 self.next_beat_time = now + period_s as f64;
             }
 
