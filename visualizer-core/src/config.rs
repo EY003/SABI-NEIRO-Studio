@@ -1204,6 +1204,12 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub static_colors: Option<Vec<[u8; 3]>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gradient_stops: Option<Vec<GradientStop>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub color_change_colors: Option<Vec<[u8; 3]>>,
+
+    // ── New Visualizer Dynamics & Beat-Clock Settings ──
+    #[serde(default = "default_true")] pub onset_spikes_enabled: bool,
+    #[serde(default = "default_true")] pub beat_envelope_pump: bool,
+    #[serde(default = "default_true")] pub beat_anticipation: bool,
+    #[serde(default)]                  pub beat_clock_animation: bool,
 }
 
 fn default_height_scale() -> f32 { DEFAULT_HEIGHT_SCALE }
@@ -1211,6 +1217,7 @@ fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
 fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
 fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
 fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
+fn default_true() -> bool { true }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -1253,6 +1260,10 @@ impl Default for AppConfig {
             config_version: CURRENT_CONFIG_VERSION,
             num_bars: None, fft_size: None, audio_update_ms: None, sensitivity: None,
             bar_color: None, static_colors: None, gradient_stops: None, color_change_colors: None,
+            onset_spikes_enabled: true,
+            beat_envelope_pump: true,
+            beat_anticipation: true,
+            beat_clock_animation: false,
         }
     }
 }
