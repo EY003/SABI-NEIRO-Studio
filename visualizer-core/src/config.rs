@@ -626,6 +626,9 @@ pub struct AudioSettings {
     #[serde(default = "default_beat_envelope_decay")]  pub beat_envelope_decay_ms: f32,
     #[serde(default)]                                  pub bpm_multiplier: BpmMultiplier,
     #[serde(default = "default_latency_offset_ms")]    pub latency_offset_ms: f32,
+    /// When true the tempo is fixed to `manual_bpm` instead of being detected.
+    #[serde(default)]                                  pub manual_bpm_enabled: bool,
+    #[serde(default = "default_manual_bpm")]           pub manual_bpm: f32,
 
     // Chroma
     #[serde(default = "default_chroma_enabled")]       pub chroma_enabled: bool,
@@ -638,6 +641,8 @@ impl AudioSettings {
         self.num_bars = other.num_bars;
         self.channel_mix = other.channel_mix;
         self.latency_offset_ms = other.latency_offset_ms;
+        self.manual_bpm_enabled = other.manual_bpm_enabled;
+        self.manual_bpm = other.manual_bpm;
         self.raw_gain = other.raw_gain;
         self.poll_rate_hz = other.poll_rate_hz;
     }
@@ -677,6 +682,7 @@ fn default_per_frame_normalization() -> bool { DEFAULT_PER_FRAME_NORMALIZATION }
 fn default_beat_envelope_decay() -> f32 { DEFAULT_BEAT_ENVELOPE_DECAY_MS }
 fn default_peak_bloom() -> bool { DEFAULT_PEAK_BLOOM }
 fn default_latency_offset_ms() -> f32 { 0.0 }
+fn default_manual_bpm() -> f32 { 120.0 }
 fn default_chroma_enabled() -> bool { true }
 
 impl Default for AudioSettings {
@@ -717,6 +723,7 @@ impl Default for AudioSettings {
             beat_envelope_decay_ms: DEFAULT_BEAT_ENVELOPE_DECAY_MS,
             bpm_multiplier: BpmMultiplier::Normal,
             latency_offset_ms: 0.0,
+            manual_bpm_enabled: false, manual_bpm: 120.0,
             chroma_enabled: true,
         }
     }
@@ -1310,6 +1317,8 @@ pub struct ReactiveSettings {
     pub dyn_low_brightness: f32,
     pub dyn_high_brightness: f32,
     pub dyn_memory_s: f32,
+    pub dyn_typical_db: f32,
+    pub dyn_absolute_blend: f32,
     pub dyn_attack_ms: f32,
     pub dyn_release_ms: f32,
     pub dyn_contrast: f32,
@@ -1384,7 +1393,8 @@ impl Default for ReactiveSettings {
             dynamics_color: false,
             dyn_low_saturation: 0.35, dyn_high_saturation: 1.30,
             dyn_low_brightness: 0.80, dyn_high_brightness: 1.10,
-            dyn_memory_s: 90.0, dyn_attack_ms: 120.0, dyn_release_ms: 1500.0,
+            dyn_memory_s: 90.0, dyn_typical_db: -22.0, dyn_absolute_blend: 0.30,
+            dyn_attack_ms: 120.0, dyn_release_ms: 1500.0,
             dyn_contrast: 1.4,
             dyn_w_loudness: 1.0, dyn_w_attack: 0.7, dyn_w_brightness: 0.3,
         }
@@ -1402,6 +1412,184 @@ impl ReactiveSettings {
             || self.wave_wiggle || self.ghost_line || self.dynamics_color
         )
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reactive presets (built-in + custom)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReactivePreset {
+    Off, Subtle, Club, Rock, HipHop, Piano, Classical, Ambient, PitchLab, Showcase,
+}
+
+impl ReactivePreset {
+    pub fn all() -> [ReactivePreset; 10] {
+        use ReactivePreset::*;
+        [Off, Subtle, Club, Rock, HipHop, Piano, Classical, Ambient, PitchLab, Showcase]
+    }
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ReactivePreset::Off => "Off (plain bars)",
+            ReactivePreset::Subtle => "Subtle",
+            ReactivePreset::Club => "Club / EDM",
+            ReactivePreset::Rock => "Rock / Live",
+            ReactivePreset::HipHop => "Hip-Hop / Bass",
+            ReactivePreset::Piano => "Piano / Acoustic",
+            ReactivePreset::Classical => "Classical / Cinematic",
+            ReactivePreset::Ambient => "Ambient / Chill",
+            ReactivePreset::PitchLab => "Pitch Lab",
+            ReactivePreset::Showcase => "Showcase (everything)",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            ReactivePreset::Off => "Every reactive effect off. Bars behave exactly like before.",
+            ReactivePreset::Subtle => "Gentle beat pump, band texture and a mild dynamics tint. Safe for any music.",
+            ReactivePreset::Club => "Kick spikes, beat pump, wind-up, a tempo-locked colour clock and a sweeping shine. Pair with BPM Lock.",
+            ReactivePreset::Rock => "Strong snare and kick spikes, coloured drum flashes and a warm/cool band tint.",
+            ReactivePreset::HipHop => "Heavy bass sculpting, big kick spikes, swelling bars and tempo-locked colours.",
+            ReactivePreset::Piano => "No beat effects. Colours follow how hard the keys are played; the sounding notes and the lead pitch light up.",
+            ReactivePreset::Classical => "Slow, tonal and dynamic: intensity colouring, a drifting key-based hue and a faint spectrum ghost.",
+            ReactivePreset::Ambient => "Very slow, flowing colour from the key, the band balance and the dynamics, with a trace of waveform motion.",
+            ReactivePreset::PitchLab => "Analysis look: dominant pitch with harmonics, per-note lighting and a raw-spectrum ghost line.",
+            ReactivePreset::Showcase => "Nearly every effect at a moderate level, to see what each one does.",
+        }
+    }
+    pub fn settings(self) -> ReactiveSettings {
+        let d = ReactiveSettings::default();
+        match self {
+            ReactivePreset::Off => d,
+
+            ReactivePreset::Subtle => ReactiveSettings {
+                beat_pump: true, pump_height: 0.06, pump_width: 0.0, pump_peak: 0.4,
+                band_sculpt: true, sculpt_bass: 0.05, sculpt_region: 0.08, sculpt_peak: 0.3,
+                dynamics_color: true, dyn_low_saturation: 0.6, dyn_high_saturation: 1.15,
+                dyn_low_brightness: 0.9, dyn_high_brightness: 1.05, dyn_contrast: 1.2,
+                ..d
+            },
+
+            ReactivePreset::Club => ReactiveSettings {
+                onset_spikes: true, spike_kick: 0.35, spike_snare: 0.15, spike_hat: 0.10,
+                spike_decay_ms: 120.0,
+                beat_pump: true, pump_height: 0.12, pump_width: 0.08, pump_peak: 0.8,
+                windup: true, windup_depth: 0.06, windup_window: 0.30, windup_brighten: 0.15,
+                transient_snap: true, snap_amount: 0.03, flux_shimmer: 0.015, flux_outline: 0.5,
+                beat_clock_colors: true, beat_clock_beats_per_cycle: 8.0,
+                phase_sweep: true, sweep_width: 0.08, sweep_strength: 0.55, sweep_lift: 0.05,
+                onset_flash: true, flash_mode: FlashMode::Brighten, flash_strength: 0.45,
+                flash_decay_ms: 180.0,
+                dynamics_color: true, dyn_low_saturation: 0.5, dyn_high_saturation: 1.4,
+                ..d
+            },
+
+            ReactivePreset::Rock => ReactiveSettings {
+                onset_spikes: true, spike_kick: 0.22, spike_snare: 0.35, spike_hat: 0.12,
+                spike_decay_ms: 110.0,
+                beat_pump: true, pump_height: 0.08, pump_width: 0.0, pump_peak: 0.5,
+                transient_snap: true, snap_amount: 0.025, flux_shimmer: 0.02, flux_outline: 0.5,
+                onset_flash: true, flash_mode: FlashMode::Color, flash_strength: 0.5,
+                flash_decay_ms: 200.0,
+                band_colors: true, band_color_mode: BandColorMode::WarmCool,
+                band_color_strength: 0.6, band_color_spatial: 0.6,
+                dynamics_color: true, dyn_high_saturation: 1.4, dyn_contrast: 1.5,
+                ..d
+            },
+
+            ReactivePreset::HipHop => ReactiveSettings {
+                onset_spikes: true, spike_kick: 0.45, spike_snare: 0.20, spike_hat: 0.10,
+                spike_decay_ms: 160.0, spike_softness_oct: 0.45,
+                beat_pump: true, pump_height: 0.12, pump_width: 0.10, pump_peak: 0.6,
+                windup: true, windup_depth: 0.08, windup_window: 0.35,
+                band_sculpt: true, sculpt_bass: 0.25, sculpt_region: 0.10, sculpt_peak: 0.8,
+                beat_clock_colors: true, beat_clock_beats_per_cycle: 4.0,
+                band_colors: true, band_color_mode: BandColorMode::Blend,
+                band_color_strength: 0.45, band_color_spatial: 0.6,
+                dynamics_color: true,
+                ..d
+            },
+
+            ReactivePreset::Piano => ReactiveSettings {
+                dynamics_color: true, dyn_low_saturation: 0.30, dyn_high_saturation: 1.40,
+                dyn_low_brightness: 0.75, dyn_high_brightness: 1.15, dyn_contrast: 2.0,
+                dyn_memory_s: 60.0, dyn_w_loudness: 1.0, dyn_w_attack: 1.2, dyn_w_brightness: 0.5,
+                chroma_bars: true, chroma_tint: 0.45, chroma_brighten: 0.35, chroma_contrast: 2.5,
+                pitch_highlight: true, pitch_strength: 0.7, pitch_width_bars: 1.5,
+                pitch_cap_px: 4.0, pitch_harmonics: true, pitch_hold_ms: 250.0,
+                pitch_glide_ms: 60.0,
+                ghost_line: true, ghost_opacity: 140, ghost_thickness: 1.0,
+                ..d
+            },
+
+            ReactivePreset::Classical => ReactiveSettings {
+                dynamics_color: true, dyn_low_saturation: 0.35, dyn_high_saturation: 1.30,
+                dyn_contrast: 1.6, dyn_memory_s: 120.0,
+                chroma_rotate: true, chroma_rotate_amount: 0.6, chroma_rotate_speed: 40.0,
+                band_sculpt: true, sculpt_bass: 0.05, sculpt_region: 0.12, sculpt_peak: 0.3,
+                band_colors: true, band_color_mode: BandColorMode::Blend,
+                band_color_strength: 0.30, band_color_sharpness: 1.2, band_color_spatial: 0.8,
+                ghost_line: true, ghost_opacity: 110,
+                ..d
+            },
+
+            ReactivePreset::Ambient => ReactiveSettings {
+                chroma_rotate: true, chroma_rotate_amount: 1.0, chroma_rotate_speed: 25.0,
+                band_colors: true, band_color_mode: BandColorMode::Blend,
+                band_color_strength: 0.50, band_color_sharpness: 1.2, band_color_spatial: 0.4,
+                dynamics_color: true, dyn_low_saturation: 0.6, dyn_high_saturation: 1.2,
+                dyn_contrast: 1.0, dyn_release_ms: 3000.0,
+                band_sculpt: true, sculpt_bass: 0.0, sculpt_region: 0.12, sculpt_peak: 0.0,
+                wave_wiggle: true, wiggle_amount: 0.015, wiggle_x_px: 0.0,
+                ..d
+            },
+
+            ReactivePreset::PitchLab => ReactiveSettings {
+                pitch_highlight: true, pitch_strength: 0.8, pitch_width_bars: 1.5,
+                pitch_cap_px: 5.0, pitch_outline: true, pitch_harmonics: true,
+                pitch_harmonic_strength: 0.6,
+                chroma_bars: true, chroma_tint: 0.6, chroma_brighten: 0.3, chroma_contrast: 2.0,
+                ghost_line: true, ghost_thickness: 1.5, ghost_opacity: 190,
+                ..d
+            },
+
+            ReactivePreset::Showcase => ReactiveSettings {
+                onset_spikes: true,
+                beat_pump: true, pump_width: 0.05,
+                windup: true, windup_brighten: 0.1,
+                band_sculpt: true,
+                transient_snap: true,
+                beat_clock_colors: true, beat_clock_beats_per_cycle: 8.0,
+                phase_sweep: true,
+                onset_flash: true, flash_strength: 0.4,
+                chroma_bars: true, chroma_tint: 0.3, chroma_brighten: 0.25,
+                band_colors: true, band_color_strength: 0.35,
+                pitch_highlight: true,
+                ghost_line: true, ghost_opacity: 120,
+                dynamics_color: true,
+                ..d
+            },
+        }
+    }
+    /// Applies the preset, keeping the master switch as the user left it.
+    pub fn apply(self, s: &mut ReactiveSettings) {
+        let enabled = s.enabled;
+        *s = self.settings();
+        s.enabled = enabled;
+    }
+    pub fn detect(s: &ReactiveSettings) -> Option<ReactivePreset> {
+        for p in Self::all() {
+            let mut candidate = p.settings();
+            candidate.enabled = s.enabled;
+            if candidate == *s { return Some(p); }
+        }
+        None
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CustomReactivePreset {
+    pub name: String,
+    pub settings: ReactiveSettings,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1462,6 +1650,7 @@ pub struct AppConfig {
     #[serde(default)] pub track_info: TrackInfoConfig,
     #[serde(default)] pub audio: AudioSettings,
     #[serde(default)] pub reactive: ReactiveSettings,
+    #[serde(default)] pub custom_reactive_presets: Vec<CustomReactivePreset>,
     #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
 
     #[serde(default)] pub config_version: u32,
@@ -1521,6 +1710,7 @@ impl Default for AppConfig {
             track_info: TrackInfoConfig::default(),
             audio: AudioSettings::default(),
             reactive: ReactiveSettings::default(),
+            custom_reactive_presets: Vec::new(),
             custom_audio_presets: Vec::new(),
             config_version: CURRENT_CONFIG_VERSION,
             num_bars: None, fft_size: None, audio_update_ms: None, sensitivity: None,
