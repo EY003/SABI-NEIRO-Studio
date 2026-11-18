@@ -1135,6 +1135,276 @@ where D: serde::Deserializer<'de> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Reactive visual effects
+//
+// Everything here is purely visual: it never changes the analysis
+// (audio.rs) and is kept out of AudioSettings on purpose, so tweaking
+// an effect never turns an audio preset into "Custom". Every effect is
+// off by default and has its own switch; `enabled` is a master switch.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SweepMode { Forward, Reverse, PingPong }
+impl Default for SweepMode { fn default() -> Self { SweepMode::Forward } }
+impl SweepMode {
+    pub fn all() -> [SweepMode; 3] { [SweepMode::Forward, SweepMode::Reverse, SweepMode::PingPong] }
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SweepMode::Forward => "Bass → Treble",
+            SweepMode::Reverse => "Treble → Bass",
+            SweepMode::PingPong => "Ping-Pong",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlashMode { Brighten, Color }
+impl Default for FlashMode { fn default() -> Self { FlashMode::Brighten } }
+impl FlashMode {
+    pub fn all() -> [FlashMode; 2] { [FlashMode::Brighten, FlashMode::Color] }
+    pub fn display_name(self) -> &'static str {
+        match self {
+            FlashMode::Brighten => "Brighten (toward white)",
+            FlashMode::Color => "Flash colors (kick / snare / hat)",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BandColorMode { Blend, WarmCool }
+impl Default for BandColorMode { fn default() -> Self { BandColorMode::Blend } }
+impl BandColorMode {
+    pub fn all() -> [BandColorMode; 2] { [BandColorMode::Blend, BandColorMode::WarmCool] }
+    pub fn display_name(self) -> &'static str {
+        match self {
+            BandColorMode::Blend => "Blend 4 colors",
+            BandColorMode::WarmCool => "Warm bass / cool treble tint",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GhostSource { Aligned, RawSpectrum }
+impl Default for GhostSource { fn default() -> Self { GhostSource::Aligned } }
+impl GhostSource {
+    pub fn all() -> [GhostSource; 2] { [GhostSource::Aligned, GhostSource::RawSpectrum] }
+    pub fn display_name(self) -> &'static str {
+        match self {
+            GhostSource::Aligned => "Pre-ballistics bars (aligned)",
+            GhostSource::RawSpectrum => "Raw spectrum_row (fixed dB scale)",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ReactiveSettings {
+    /// Master switch. When off, nothing below has any effect.
+    pub enabled: bool,
+
+    // 1 — Per-band onset spikes
+    pub onset_spikes: bool,
+    pub spike_kick: f32,
+    pub spike_snare: f32,
+    pub spike_hat: f32,
+    pub spike_decay_ms: f32,
+    pub spike_softness_oct: f32,
+
+    // 2 — Beat envelope pump
+    pub beat_pump: bool,
+    pub pump_height: f32,
+    pub pump_width: f32,
+    pub pump_peak: f32,
+
+    // 3 — Pre-beat wind-up
+    pub windup: bool,
+    pub windup_depth: f32,
+    pub windup_window: f32,
+    pub windup_brighten: f32,
+
+    // 4 — Band sculpting
+    pub band_sculpt: bool,
+    pub sculpt_bass: f32,
+    pub sculpt_region: f32,
+    pub sculpt_peak: f32,
+
+    // 5 — Transient snap & flux shimmer
+    pub transient_snap: bool,
+    pub snap_amount: f32,
+    pub snap_threshold: f32,
+    pub flux_shimmer: f32,
+    pub flux_outline: f32,
+
+    // 6 — Beat-clock animated colors
+    pub beat_clock_colors: bool,
+    pub beat_clock_beats_per_cycle: f32,
+
+    // 7 — Phase sweep highlight
+    pub phase_sweep: bool,
+    pub sweep_mode: SweepMode,
+    pub sweep_width: f32,
+    pub sweep_strength: f32,
+    pub sweep_lift: f32,
+    pub sweep_color: [u8; 3],
+
+    // 8 — Phase wave lean / breathing
+    pub phase_wave: bool,
+    pub pw_sway_px: f32,
+    pub pw_height: f32,
+    pub pw_count: f32,
+    pub pw_dim: f32,
+
+    // 9 — Per-band onset flash overlay
+    pub onset_flash: bool,
+    pub flash_mode: FlashMode,
+    pub flash_strength: f32,
+    pub flash_decay_ms: f32,
+    pub flash_colors: [[u8; 3]; 3],
+
+    // 10 — Chroma wheel & chord lighting
+    pub chroma_rotate: bool,
+    pub chroma_rotate_amount: f32,
+    pub chroma_rotate_speed: f32,
+    pub chroma_bars: bool,
+    pub chroma_tint: f32,
+    pub chroma_brighten: f32,
+    pub chroma_contrast: f32,
+
+    // 11 — Live 4-band color blending
+    pub band_colors: bool,
+    pub band_color_mode: BandColorMode,
+    pub band_color_strength: f32,
+    pub band_color_sharpness: f32,
+    pub band_color_spatial: f32,
+    pub band_color_list: [[u8; 3]; 4],
+
+    // 12 — Dominant pitch highlight & harmonics
+    pub pitch_highlight: bool,
+    pub pitch_color: [u8; 3],
+    pub pitch_strength: f32,
+    pub pitch_width_bars: f32,
+    pub pitch_cap_px: f32,
+    pub pitch_outline: bool,
+    pub pitch_harmonics: bool,
+    pub pitch_harmonic_strength: f32,
+    pub pitch_hold_ms: f32,
+    pub pitch_glide_ms: f32,
+
+    // 13 — Waveform tip wiggle
+    pub wave_wiggle: bool,
+    pub wiggle_amount: f32,
+    pub wiggle_x_px: f32,
+
+    // 14 — Raw spectrum ghost line
+    pub ghost_line: bool,
+    pub ghost_source: GhostSource,
+    pub ghost_thickness: f32,
+    pub ghost_color: [u8; 3],
+    pub ghost_opacity: u8,
+    pub ghost_gain: f32,
+
+    // Extra — Dynamics ("velocity") color
+    pub dynamics_color: bool,
+    pub dyn_low_saturation: f32,
+    pub dyn_high_saturation: f32,
+    pub dyn_low_brightness: f32,
+    pub dyn_high_brightness: f32,
+    pub dyn_memory_s: f32,
+    pub dyn_attack_ms: f32,
+    pub dyn_release_ms: f32,
+    pub dyn_contrast: f32,
+    pub dyn_w_loudness: f32,
+    pub dyn_w_attack: f32,
+    pub dyn_w_brightness: f32,
+}
+
+impl Default for ReactiveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+
+            onset_spikes: false,
+            spike_kick: 0.30, spike_snare: 0.22, spike_hat: 0.15,
+            spike_decay_ms: 140.0, spike_softness_oct: 0.35,
+
+            beat_pump: false,
+            pump_height: 0.10, pump_width: 0.0, pump_peak: 0.6,
+
+            windup: false,
+            windup_depth: 0.05, windup_window: 0.30, windup_brighten: 0.0,
+
+            band_sculpt: false,
+            sculpt_bass: 0.10, sculpt_region: 0.15, sculpt_peak: 0.5,
+
+            transient_snap: false,
+            snap_amount: 0.02, snap_threshold: 0.60,
+            flux_shimmer: 0.02, flux_outline: 0.5,
+
+            beat_clock_colors: false,
+            beat_clock_beats_per_cycle: 4.0,
+
+            phase_sweep: false,
+            sweep_mode: SweepMode::Forward,
+            sweep_width: 0.10, sweep_strength: 0.60, sweep_lift: 0.0,
+            sweep_color: [255, 255, 255],
+
+            phase_wave: false,
+            pw_sway_px: 3.0, pw_height: 0.04, pw_count: 1.5, pw_dim: 0.0,
+
+            onset_flash: false,
+            flash_mode: FlashMode::Brighten,
+            flash_strength: 0.60, flash_decay_ms: 220.0,
+            flash_colors: [[255, 80, 60], [255, 210, 80], [110, 200, 255]],
+
+            chroma_rotate: false,
+            chroma_rotate_amount: 1.0, chroma_rotate_speed: 120.0,
+            chroma_bars: false,
+            chroma_tint: 0.35, chroma_brighten: 0.35, chroma_contrast: 2.0,
+
+            band_colors: false,
+            band_color_mode: BandColorMode::Blend,
+            band_color_strength: 0.50, band_color_sharpness: 1.5, band_color_spatial: 0.5,
+            band_color_list: [[255, 70, 40], [255, 170, 40], [80, 220, 120], [70, 150, 255]],
+
+            pitch_highlight: false,
+            pitch_color: [255, 230, 90],
+            pitch_strength: 0.80, pitch_width_bars: 2.0, pitch_cap_px: 4.0,
+            pitch_outline: false,
+            pitch_harmonics: false, pitch_harmonic_strength: 0.5,
+            pitch_hold_ms: 150.0, pitch_glide_ms: 40.0,
+
+            wave_wiggle: false,
+            wiggle_amount: 0.02, wiggle_x_px: 0.0,
+
+            ghost_line: false,
+            ghost_source: GhostSource::Aligned,
+            ghost_thickness: 1.0, ghost_color: [255, 255, 255],
+            ghost_opacity: 170, ghost_gain: 1.0,
+
+            dynamics_color: false,
+            dyn_low_saturation: 0.35, dyn_high_saturation: 1.30,
+            dyn_low_brightness: 0.80, dyn_high_brightness: 1.10,
+            dyn_memory_s: 90.0, dyn_attack_ms: 120.0, dyn_release_ms: 1500.0,
+            dyn_contrast: 1.4,
+            dyn_w_loudness: 1.0, dyn_w_attack: 0.7, dyn_w_brightness: 0.3,
+        }
+    }
+}
+
+impl ReactiveSettings {
+    /// True when the master switch is on and at least one effect is enabled.
+    pub fn any_active(&self) -> bool {
+        self.enabled && (
+            self.onset_spikes || self.beat_pump || self.windup || self.band_sculpt
+            || self.transient_snap || self.beat_clock_colors || self.phase_sweep
+            || self.phase_wave || self.onset_flash || self.chroma_rotate
+            || self.chroma_bars || self.band_colors || self.pitch_highlight
+            || self.wave_wiggle || self.ghost_line || self.dynamics_color
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 // App config
 // ─────────────────────────────────────────────────────────────
 
@@ -1191,6 +1461,7 @@ pub struct AppConfig {
     // Track info / audio
     #[serde(default)] pub track_info: TrackInfoConfig,
     #[serde(default)] pub audio: AudioSettings,
+    #[serde(default)] pub reactive: ReactiveSettings,
     #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
 
     #[serde(default)] pub config_version: u32,
@@ -1249,6 +1520,7 @@ impl Default for AppConfig {
             color_presets: default_color_presets(),
             track_info: TrackInfoConfig::default(),
             audio: AudioSettings::default(),
+            reactive: ReactiveSettings::default(),
             custom_audio_presets: Vec::new(),
             config_version: CURRENT_CONFIG_VERSION,
             num_bars: None, fft_size: None, audio_update_ms: None, sensitivity: None,
