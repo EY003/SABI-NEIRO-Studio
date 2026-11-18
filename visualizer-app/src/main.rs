@@ -724,7 +724,9 @@ struct SettingsState {
     /// Live readout of the dynamics analyser (written by the app each frame).
     fx_intensity: f32,
     /// Set by the UI to ask the app to forget the current track's dynamics memory.
-    fx_reset: bool,
+    fx_reset: u8,
+    new_reactive_preset_name: String,
+    pending_reactive_preset_delete: Option<usize>,
 }
 
 fn lock_state(m: &Mutex<SettingsState>) -> std::sync::MutexGuard<'_, SettingsState> {
@@ -922,7 +924,9 @@ impl VisualizerApp {
             system_fonts: list_system_fonts(),
             tap_tx: tap_tx.clone(),
             fx_intensity: 0.5,
-            fx_reset: false,
+            fx_reset: 0,
+            new_reactive_preset_name: String::new(),
+            pending_reactive_preset_delete: None,
         }));
 
         Self {
@@ -1258,7 +1262,7 @@ impl VisualizerApp {
                 && self.cover_texture.is_some() == info.cover_art.is_some();
 
             if !unchanged {
-                self.fx.dynamics.reset();
+                self.fx.dynamics.reset_track();
                 let decoded = info
                     .cover_art
                     .as_ref()
@@ -3981,6 +3985,17 @@ impl SettingsState {
         );
         help_text(ui, show_help, a.bpm_multiplier.description());
 
+        checkbox_reset(ui, &mut a.manual_bpm_enabled, "Manual Tempo", false);
+        help_text(
+            ui,
+            show_help,
+            "Use a fixed tempo instead of detecting one. Applies to BPM Lock and every beat-dependent reactive effect. The BPM Multiplier is ignored while this is on.",
+        );
+        if a.manual_bpm_enabled {
+            slider_f32(ui, &mut a.manual_bpm, 40.0..=240.0, "Tempo (BPM)", 120.0);
+            help_text(ui, show_help, "Beats per minute. Tap Tempo still overrides it for 5 seconds.");
+        }
+
         slider_f32(
             ui,
             &mut a.latency_offset_ms,
@@ -4657,6 +4672,39 @@ impl VisualizerApp {
                 });
         }
 
+        if let Some(idx) = st.pending_reactive_preset_delete {
+            let center = self
+                .settings_rect
+                .map(|r| r.center())
+                .unwrap_or_else(|| monitor.center() - ov);
+            egui::Window::new("Confirm Delete ")
+                .collapsible(false)
+                .resizable(false)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .fixed_pos(center)
+                .show(ctx, |ui| {
+                    let name = st
+                        .config
+                        .custom_reactive_presets
+                        .get(idx)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    ui.label(format!("Delete preset '{}'?", name));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            if idx < st.config.custom_reactive_presets.len() {
+                                st.config.custom_reactive_presets.remove(idx);
+                            }
+                            st.pending_reactive_preset_delete = None;
+                        }
+                        if ui.button("No").clicked() {
+                            st.pending_reactive_preset_delete = None;
+                        }
+                    });
+                });
+        }
+
         let fp = config_fingerprint(&st.config);
         let changed = st.audio_dirty || fp != st.last_fingerprint;
         st.last_fingerprint = fp;
@@ -4782,10 +4830,12 @@ impl eframe::App for VisualizerApp {
             self.seen_gen = generation;
             let mut st = lock_state(&self.shared);
             self.config = st.config.clone();
-            if st.fx_reset {
-                self.fx.dynamics.reset();
-                st.fx_reset = false;
+            match st.fx_reset {
+                1 => self.fx.dynamics.reset_track(),
+                2 => self.fx.dynamics.reset_all(),
+                _ => {}
             }
+            st.fx_reset = 0;
             if st.audio_dirty || self.config.audio != *self.audio_settings.load_full() {
                 self.audio_settings.store(Arc::new(self.config.audio.clone()));
                 st.audio_dirty = false;
