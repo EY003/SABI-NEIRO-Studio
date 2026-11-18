@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod overlay;
+mod reactive;
 
 use eframe::egui;
 use image::DynamicImage;
@@ -154,14 +155,17 @@ fn draw_peak_hold(
     bar_width: f32,
     color: egui::Color32,
     is_smooth: bool,
+    scale: f32,
 ) {
     let pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
+    let scale = scale.max(0.1);
     if is_smooth {
-        painter.circle_filled(pos, (bar_width / 4.0).clamp(1.0, 3.0), color);
+        painter.circle_filled(pos, (bar_width / 4.0).clamp(1.0, 3.0) * scale, color);
     } else {
+        let thick = 3.0 * scale;
         let dash_size = match dir {
-            VisualizerDirection::Up | VisualizerDirection::Down => egui::vec2(bar_width, 3.0),
-            VisualizerDirection::Left | VisualizerDirection::Right => egui::vec2(3.0, bar_width),
+            VisualizerDirection::Up | VisualizerDirection::Down => egui::vec2(bar_width, thick),
+            VisualizerDirection::Left | VisualizerDirection::Right => egui::vec2(thick, bar_width),
         };
         let rect = egui::Rect::from_center_size(pos, dash_size);
         painter.rect_filled(rect, 1.0, color);
@@ -592,6 +596,7 @@ enum SettingsTab {
     Visualizer,
     Colors,
     Audio,
+    Reactive,
     TrackInfo,
     Display,
 }
@@ -615,6 +620,10 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Audio, "Equalizer", &["eq", "bass", "mid", "treble", "tilt"]),
     (SettingsTab::Audio, "Ballistics", &["attack", "decay", "gravity", "peak"]),
     (SettingsTab::Audio, "Rhythm", &["beat", "bpm", "tempo", "phase", "tap", "chroma", "latency"]),
+    (SettingsTab::Reactive, "Reactive Effects", &["reactive", "effects", "onset", "kick", "snare", "hat", "pump", "beat", "windup", "sculpt", "snap", "shimmer", "flux"]),
+    (SettingsTab::Reactive, "Beat-Locked Motion", &["beat clock", "phase", "sweep", "wave", "sway", "tempo", "bpm", "sync"]),
+    (SettingsTab::Reactive, "Reactive Colors", &["chroma", "chord", "key", "flash", "band", "color", "hue", "tint", "dynamics", "velocity", "intensity", "piano"]),
+    (SettingsTab::Reactive, "Pitch & Signal Detail", &["pitch", "harmonic", "waveform", "wiggle", "ghost", "spectrum", "line"]),
     (SettingsTab::TrackInfo, "Cover Art", &["cover", "art", "album"]),
     (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text", "shadow", "outline"]),
     (SettingsTab::Display, "Background", &["background", "bg", "opacity"]),
@@ -712,6 +721,10 @@ struct SettingsState {
     last_bpm: f32,
     system_fonts: Vec<(String, String)>,
     tap_tx: crossbeam_channel::Sender<Instant>,
+    /// Live readout of the dynamics analyser (written by the app each frame).
+    fx_intensity: f32,
+    /// Set by the UI to ask the app to forget the current track's dynamics memory.
+    fx_reset: bool,
 }
 
 fn lock_state(m: &Mutex<SettingsState>) -> std::sync::MutexGuard<'_, SettingsState> {
@@ -799,6 +812,7 @@ struct VisualizerApp {
     _hotkey_manager: GlobalHotKeyManager,
 
     mesh: MeshBuilder,
+    fx: reactive::FxState,
 }
 
 impl VisualizerApp {
@@ -907,6 +921,8 @@ impl VisualizerApp {
             last_bpm: 0.0,
             system_fonts: list_system_fonts(),
             tap_tx: tap_tx.clone(),
+            fx_intensity: 0.5,
+            fx_reset: false,
         }));
 
         Self {
@@ -966,6 +982,7 @@ impl VisualizerApp {
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
+            fx: reactive::FxState::new(),
         }
     }
 
@@ -1241,6 +1258,7 @@ impl VisualizerApp {
                 && self.cover_texture.is_some() == info.cover_art.is_some();
 
             if !unchanged {
+                self.fx.dynamics.reset();
                 let decoded = info
                     .cover_art
                     .as_ref()
@@ -1335,7 +1353,23 @@ impl VisualizerApp {
         egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
     }
 
+    /// Base colour for a bar position, with all reactive colour effects applied.
+    #[inline]
     fn get_color_at(
+        &self,
+        i: usize,
+        total_bars: usize,
+        x: f32,
+        y: f32,
+        t: f32,
+        rect: egui::Rect,
+        time: f32,
+    ) -> egui::Color32 {
+        let c = self.get_color_at_base(i, total_bars, x, y, t, rect, time);
+        self.fx_color(c, i)
+    }
+
+    fn get_color_at_base(
         &self,
         i: usize,
         total_bars: usize,
@@ -1735,7 +1769,7 @@ impl VisualizerApp {
     ) {
         let Some(info) = &self.track_info else { return };
         let cfg = &self.config.track_info;
-        let time = ctx.input(|i| i.time) as f32;
+        let time = self.fx.sync_time;
         let margin = 40.0;
         let art_size = cfg.cover_size;
         let text_gap = 14.0;
@@ -1805,11 +1839,12 @@ impl VisualizerApp {
         monitor: egui::Rect,
         overlay_origin: egui::Pos2,
     ) {
+        let _ = ctx;
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 {
             return;
         }
-        let time = ctx.input(|i| i.time) as f32;
+        let time = self.fx.sync_time;
         let visual_num_bars = self.visual_num_bars();
 
         let bar_width = self.config.bar_width;
@@ -1976,20 +2011,23 @@ impl VisualizerApp {
         if outline_on {
             let oc = self.config.visualizer_outline_color;
             let stroke_color = self.apply_vis(egui::Color32::from_rgb(oc[0], oc[1], oc[2]));
-            let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, stroke_color);
+            let stroke = egui::Stroke::new(
+                self.config.visualizer_outline_thickness * self.fx.outline_scale,
+                stroke_color,
+            );
 
             if is_smooth {
                 if visual_num_bars > 0 {
-                    let first_edge = start_pos;
                     let last_i = visual_num_bars - 1;
-                    let last_edge = start_pos + last_i as f32 * stride + bar_width;
-
                     let first_idx = frequency_index(0, base_num_bars, freq_dir);
                     let last_idx = frequency_index(last_i, base_num_bars, freq_dir);
-                    let first_len = (self.current_bars[first_idx] * rect_len)
-                        .min(if max_h > 0.0 { max_h } else { rect_len });
-                    let last_len = (self.current_bars[last_idx] * rect_len)
-                        .min(if max_h > 0.0 { max_h } else { rect_len });
+                    let first_edge = start_pos + self.fx.shift(first_idx);
+                    let last_edge = start_pos
+                        + last_i as f32 * stride
+                        + bar_width
+                        + self.fx.shift(last_idx);
+                    let first_len = self.bar_len_px(first_idx, rect_len, max_h);
+                    let last_len = self.bar_len_px(last_idx, rect_len, max_h);
 
                     let mut points: Vec<egui::Pos2> =
                         Vec::with_capacity(visual_num_bars + 4);
@@ -1999,9 +2037,11 @@ impl VisualizerApp {
 
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let len = (self.current_bars[idx] * rect_len)
-                            .min(if max_h > 0.0 { max_h } else { rect_len });
-                        let perp = start_pos + i as f32 * stride + bar_width / 2.0;
+                        let len = self.bar_len_px(idx, rect_len, max_h);
+                        let perp = start_pos
+                            + i as f32 * stride
+                            + bar_width / 2.0
+                            + self.fx.shift(idx);
                         points.push(bar_vertex(dir, perp, anchor, len, 1.0));
                     }
 
@@ -2013,13 +2053,14 @@ impl VisualizerApp {
             } else {
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let len = (self.current_bars[idx] * rect_len)
-                        .min(if max_h > 0.0 { max_h } else { rect_len });
+                    let len = self.bar_len_px(idx, rect_len, max_h);
                     if len <= 0.5 {
                         continue;
                     }
-                    let perp = start_pos + i as f32 * stride;
-                    let rect = self.bar_rect(dir, perp, bar_width, anchor, len);
+                    let bw = bar_width * self.fx.width_mul(idx);
+                    let perp = start_pos + i as f32 * stride + self.fx.shift(idx)
+                        - (bw - bar_width) * 0.5;
+                    let rect = self.bar_rect(dir, perp, bw, anchor, len);
                     painter.rect_stroke(rect, 0.0, stroke);
                 }
             }
@@ -2028,27 +2069,28 @@ impl VisualizerApp {
         if self.config.audio.peak_hold_ms > 0.0 {
             for i in 0..visual_num_bars {
                 let idx = frequency_index(i, base_num_bars, freq_dir);
-                let mut peak_len = self.current_peaks[idx] * rect_len;
-                if max_h > 0.0 {
-                    peak_len = peak_len.min(max_h);
-                }
+                let bar_l = self.bar_len_px(idx, rect_len, max_h);
+                let peak_len = self.peak_len_px(idx, rect_len, max_h, bar_l);
                 if peak_len <= 0.001 {
                     continue;
                 }
-                let perp = start_pos + i as f32 * stride + bar_width / 2.0;
+                let perp = start_pos + i as f32 * stride + bar_width / 2.0 + self.fx.shift(idx);
                 let color = if is_static_multi_vertical {
                     let t = (peak_len / rect_len).clamp(0.0, 1.0);
-                    self.apply_vis(static_multi_vertical_color(
-                        &self.active_palettes.static_multi_colors,
-                        t,
-                        is_blocks,
-                    ))
+                    self.fx_color(
+                        self.apply_vis(static_multi_vertical_color(
+                            &self.active_palettes.static_multi_colors,
+                            t,
+                            is_blocks,
+                        )),
+                        i,
+                    )
                 } else if is_animated_vertical {
                     let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
                     let x_norm = ((peak_pos.x - gradient_rect.left())
                         / gradient_rect.width().max(1.0))
                     .clamp(0.0, 1.0);
-                    self.apply_vis(self.sample_color_changing(x_norm, 1.0, time))
+                    self.fx_color(self.apply_vis(self.sample_color_changing(x_norm, 1.0, time)), i)
                 } else {
                     let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
                     self.get_color_at(
@@ -2061,9 +2103,17 @@ impl VisualizerApp {
                         time,
                     )
                 };
-                draw_peak_hold(painter, dir, anchor, perp, peak_len, bar_width, color, is_smooth);
+                draw_peak_hold(
+                    painter, dir, anchor, perp, peak_len, bar_width, color, is_smooth,
+                    self.fx.peak_scale(idx),
+                );
             }
         }
+
+        self.draw_fx_overlays(
+            painter, dir, start_pos, anchor, rect_len, bar_width, stride,
+            visual_num_bars, base_num_bars, freq_dir, max_h,
+        );
     }
 
     #[inline]
@@ -2115,14 +2165,15 @@ impl VisualizerApp {
     ) {
         for i in 0..visual_num_bars {
             let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len)
-                .min(if max_h > 0.0 { max_h } else { rect_len });
+            let len = self.bar_len_px(idx, rect_len, max_h);
             if len <= 0.5 {
                 continue;
             }
-            let perp_start = start_pos + i as f32 * stride;
-            let bar_rect = self.bar_rect(dir, perp_start, bar_width, anchor, len);
-            let perp_center = perp_start + bar_width / 2.0;
+            let bw = bar_width * self.fx.width_mul(idx);
+            let perp_start = start_pos + i as f32 * stride + self.fx.shift(idx)
+                - (bw - bar_width) * 0.5;
+            let bar_rect = self.bar_rect(dir, perp_start, bw, anchor, len);
+            let perp_center = perp_start + bw / 2.0;
 
             if is_vertical {
                 for k in 0..n_segments {
@@ -2147,6 +2198,7 @@ impl VisualizerApp {
                         self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
                     };
 
+                    let color = self.fx_color(color, i);
                     let (p1, p2, p3, p4) = (
                         seg_rect.left_top(),
                         seg_rect.left_bottom(),
@@ -2225,9 +2277,8 @@ impl VisualizerApp {
         let mut bars: Vec<Sample> = Vec::with_capacity(visual_num_bars);
         for i in 0..visual_num_bars {
             let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len)
-                .min(if max_h > 0.0 { max_h } else { rect_len });
-            let perp = start_pos + i as f32 * stride + bar_width / 2.0;
+            let len = self.bar_len_px(idx, rect_len, max_h);
+            let perp = start_pos + i as f32 * stride + bar_width / 2.0 + self.fx.shift(idx);
             let (c_tip, c_base) = if is_vertical {
                 (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
             } else {
@@ -2310,6 +2361,7 @@ impl VisualizerApp {
                         } else {
                             self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
                         };
+                        let color = self.fx_color_lerp(color, i, i + 1, (t1 + t2) * 0.5);
 
                         let p1 = bar_vertex(dir, perp1, anchor, len1, t_top);
                         let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
@@ -2448,6 +2500,7 @@ impl SettingsState {
                 SettingsTab::Visualizer => self.tab_visualizer(ui),
                 SettingsTab::Colors => self.tab_colors(ui),
                 SettingsTab::Audio => self.tab_audio(ui),
+                SettingsTab::Reactive => self.tab_reactive(ui),
                 SettingsTab::TrackInfo => self.tab_track_info(ui),
                 SettingsTab::Display => self.tab_display(ui),
             });
@@ -2468,6 +2521,7 @@ impl SettingsState {
                 (SettingsTab::Visualizer, "Visualizer"),
                 (SettingsTab::Colors, "Colors"),
                 (SettingsTab::Audio, "Audio"),
+                (SettingsTab::Reactive, "Reactive"),
                 (SettingsTab::TrackInfo, "Track Info"),
                 (SettingsTab::Display, "Display"),
             ];
@@ -4523,6 +4577,7 @@ impl VisualizerApp {
         let shared = self.shared.clone();
         let mut st = lock_state(&shared);
         st.last_bpm = self.last_bpm;
+        st.fx_intensity = self.fx.dynamics.intensity;
 
         let ov = origin.to_vec2();
         let scale = st.config.settings_scale.clamp(0.75, 1.5);
@@ -4727,6 +4782,10 @@ impl eframe::App for VisualizerApp {
             self.seen_gen = generation;
             let mut st = lock_state(&self.shared);
             self.config = st.config.clone();
+            if st.fx_reset {
+                self.fx.dynamics.reset();
+                st.fx_reset = false;
+            }
             if st.audio_dirty || self.config.audio != *self.audio_settings.load_full() {
                 self.audio_settings.store(Arc::new(self.config.audio.clone()));
                 st.audio_dirty = false;
@@ -4756,11 +4815,17 @@ impl eframe::App for VisualizerApp {
         }
 
         while let Ok(frame) = self.audio_rx.try_recv() {
+            // Feed one-frame events (onsets, peak crossings, dynamics) to the
+            // reactive engine before interpolation can blur them away.
+            self.fx.on_audio_frame(&frame, &self.config.reactive);
             self.prev_frame = self.next_frame.take();
             self.next_frame = Some(frame);
         }
 
         let interp_now = Instant::now();
+        let mut fx_src: Option<BarFrame> = None;
+        let mut fx_phase = 0.0f32;
+        let mut fx_beat_in = 0.0f32;
         if let (Some(prev), Some(next)) = (&self.prev_frame, &self.next_frame) {
             let elapsed = interp_now
                 .saturating_duration_since(prev.capture_instant)
@@ -4786,6 +4851,12 @@ impl eframe::App for VisualizerApp {
                 .saturating_duration_since(interp.capture_instant)
                 .as_secs_f32();
             self.last_beat_in = interp.beat_in - elapsed_since_next;
+            // Phase is not interpolated across frames (it wraps), so extrapolate it.
+            fx_phase = if interp.bpm >= 20.0 {
+                interp.phase + elapsed_since_next * interp.bpm / 60.0
+            } else { interp.phase };
+            fx_beat_in = self.last_beat_in;
+            fx_src = Some(interp);
         } else if let Some(next) = &self.next_frame {
             let limit = self.current_bars.len().min(next.values.len());
             self.current_bars[..limit].copy_from_slice(&next.values[..limit]);
@@ -4802,6 +4873,19 @@ impl eframe::App for VisualizerApp {
                 .saturating_duration_since(next.capture_instant)
                 .as_secs_f32();
             self.last_beat_in = next.beat_in - elapsed_since_next;
+            fx_phase = if next.bpm >= 20.0 {
+                next.phase + elapsed_since_next * next.bpm / 60.0
+            } else { next.phase };
+            fx_beat_in = self.last_beat_in;
+            fx_src = Some(next.clone());
+        }
+
+        {
+            let wall = ctx.input(|i| i.time) as f32;
+            let fx_dt = dt.clamp(0.0, 0.1);
+            let n_fx = self.current_bars.len();
+            self.fx.advance_clock(fx_dt, wall, self.last_bpm, &self.config);
+            self.fx.update(fx_src.as_ref(), fx_phase, fx_beat_in, fx_dt, wall, &self.config, n_fx);
         }
 
         self.ensure_overlay(ctx);
