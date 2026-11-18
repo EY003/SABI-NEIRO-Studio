@@ -27,6 +27,20 @@ const BPM_FOLD_MAX: f64 = 180.0;
 const BEAT_MEMORY_S: f64 = 8.0;
 const BEAT_TIMEOUT_S: f64 = 5.0;
 const MAX_BEATS: usize = 12;
+
+// Tempo tracker (autocorrelation of the onset-strength curve)
+const TEMPO_FS: f32 = 100.0;            // onset-strength grid rate (Hz)
+const TEMPO_WIN: usize = 800;           // 8 s of history
+const TEMPO_MIN_N: usize = 400;         // start estimating after 4 s
+const TEMPO_LAG_MIN: usize = 30;        // 200 BPM
+const TEMPO_LAG_MAX: usize = 100;       // 60 BPM
+const TEMPO_PRIOR_BPM: f32 = 120.0;
+const TEMPO_PRIOR_SIGMA_OCT: f32 = 0.8;
+const TEMPO_W2: f32 = 0.6;              // weight of the 2x-lag (half tempo) peak
+const TEMPO_W4: f32 = 0.3;              // weight of the 4x-lag peak
+const TEMPO_CONT_BONUS: f32 = 1.35;     // preference for staying near the current tempo
+const TEMPO_CONF_MIN: f32 = 0.24;       // minimum normalised autocorrelation peak
+const TEMPO_EST_EVERY_S: f64 = 0.5;
 const WAVEFORM_LEN: usize = 1024;
 const SPECTRUM_ROW_LEN: usize = 128;
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -627,6 +641,9 @@ struct OnsetDetector {
     flux_history_total: VecDeque<f32>,
     band_armed: [bool; 3],
     last_fire: [Option<f64>; 3],
+    /// Loudness-independent onset strength of the latest frame (sum of the
+    /// three band fluxes, each divided by its own recent average).
+    last_strength: f32,
 }
 
 impl OnsetDetector {
@@ -637,10 +654,12 @@ impl OnsetDetector {
             flux_history_total: VecDeque::with_capacity(240),
             band_armed: [true; 3],
             last_fire: [None; 3],
+            last_strength: 0.0,
         }
     }
 
     fn reset(&mut self) {
+        self.last_strength = 0.0;
         for v in &mut self.prev_mags { *v = 0.0; }
         for h in &mut self.band_flux_history { h.clear(); }
         self.flux_history_total.clear();
@@ -702,6 +721,7 @@ impl OnsetDetector {
         };
 
         if self.flux_history_total.len() < min_hist {
+            self.last_strength = 0.0;
             return (onsets, false);
         }
 
@@ -711,9 +731,11 @@ impl OnsetDetector {
         let mult = 1.0 + (threshold_mult.max(1.0) - 1.0) * (1.0 - sens * 0.5);
         let min_gap = MIN_BEAT_GAP_S;
 
+        let mut strength = 0.0f32;
         for b in 0..3 {
             let h = &self.band_flux_history[b];
             let avg = h.iter().sum::<f32>() / h.len() as f32;
+            strength += (band_flux[b] / avg.max(1e-9)).min(8.0);
             let thr = avg * mult;
             let above = band_flux[b] > thr && band_flux[b] > avg * 1.05;
 
@@ -733,6 +755,8 @@ impl OnsetDetector {
             }
         }
 
+        self.last_strength = strength;
+
         let total_avg = self.flux_history_total.iter().sum::<f32>()
             / self.flux_history_total.len() as f32;
         onsets.flux = (total_flux / total_avg.max(1e-9)).min(4.0) / 4.0;
@@ -744,6 +768,171 @@ impl OnsetDetector {
             BeatFocusMode::Treble => onsets.hat,
         };
         (onsets, beat_fire)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tempo tracker
+//
+// Estimates the tempo from the *periodicity* of the onset-strength curve
+// (autocorrelation) instead of averaging gaps between detected beats.
+// Gap-averaging breaks on syncopated drums and busy hi-hats; periodicity
+// does not care which individual hit is "the beat". A continuity bonus,
+// a tempo prior and a confirmation rule keep the reported BPM from
+// wandering or flipping octaves.
+// ─────────────────────────────────────────────────────────────
+
+struct TempoTracker {
+    series: VecDeque<f32>,
+    cell: i64,
+    cur: f32,
+    started: bool,
+    next_est: f64,
+    bpm: f32,
+    cand: f32,
+    cand_n: u32,
+    conf: f32,
+}
+
+impl TempoTracker {
+    fn new() -> Self {
+        Self {
+            series: VecDeque::with_capacity(TEMPO_WIN + 1),
+            cell: 0,
+            cur: 0.0,
+            started: false,
+            next_est: 0.0,
+            bpm: 0.0,
+            cand: 0.0,
+            cand_n: 0,
+            conf: 0.0,
+        }
+    }
+
+    fn reset(&mut self) { *self = TempoTracker::new(); }
+
+    /// Feed one onset-strength sample taken at time `t` (seconds).
+    fn feed(&mut self, t: f64, strength: f32) {
+        let idx = (t * TEMPO_FS as f64).floor() as i64;
+        if !self.started {
+            self.started = true;
+            self.cell = idx;
+            self.next_est = t + TEMPO_EST_EVERY_S;
+        }
+        if idx < self.cell {
+            // Time went backwards: start over.
+            self.reset();
+            self.started = true;
+            self.cell = idx;
+            self.next_est = t + TEMPO_EST_EVERY_S;
+        }
+        if idx - self.cell > TEMPO_WIN as i64 {
+            self.series.clear();
+            self.cell = idx;
+            self.cur = 0.0;
+        }
+        while self.cell < idx {
+            self.series.push_back(self.cur);
+            self.cur = 0.0;
+            self.cell += 1;
+            if self.series.len() > TEMPO_WIN { self.series.pop_front(); }
+        }
+        self.cur = self.cur.max(strength);
+        if t >= self.next_est {
+            self.next_est = t + TEMPO_EST_EVERY_S;
+            self.estimate();
+        }
+    }
+
+    fn estimate(&mut self) {
+        let n = self.series.len();
+        if n < TEMPO_MIN_N { return; }
+        let x: Vec<f32> = self.series.iter().copied().collect();
+        let mut y = x.clone();
+        for i in 1..n - 1 {
+            y[i] = 0.25 * x[i - 1] + 0.5 * x[i] + 0.25 * x[i + 1];
+        }
+        let mean = y.iter().sum::<f32>() / n as f32;
+        for v in y.iter_mut() { *v -= mean; }
+        let r0 = y.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        if r0 < 1e-9 { self.conf = 0.0; return; }
+
+        let max_lag = (TEMPO_LAG_MAX * 4).min(n / 2);
+        let mut r = vec![0.0f32; max_lag + 2];
+        for lag in (TEMPO_LAG_MIN - 1)..=max_lag {
+            let mut sum = 0.0f32;
+            for i in 0..(n - lag) { sum += y[i] * y[i + lag]; }
+            r[lag] = sum / (n - lag) as f32 / r0;
+        }
+
+        let mut best = f32::MIN;
+        let mut best_lag = 0usize;
+        for lag in TEMPO_LAG_MIN..=TEMPO_LAG_MAX {
+            let mut sc = r[lag];
+            if 2 * lag <= max_lag { sc += TEMPO_W2 * r[2 * lag]; }
+            if 4 * lag <= max_lag { sc += TEMPO_W4 * r[4 * lag]; }
+            let bpm = 60.0 * TEMPO_FS / lag as f32;
+            let oct = (bpm / TEMPO_PRIOR_BPM).log2() / TEMPO_PRIOR_SIGMA_OCT;
+            sc *= (-0.5 * oct * oct).exp();
+            if self.bpm > 0.0 && (bpm / self.bpm - 1.0).abs() < 0.04 {
+                sc *= TEMPO_CONT_BONUS;
+            }
+            if sc > best { best = sc; best_lag = lag; }
+        }
+        if best_lag == 0 { return; }
+        self.conf = r[best_lag];
+        if self.conf < TEMPO_CONF_MIN { return; }
+
+        // Parabolic interpolation for sub-sample lag accuracy.
+        let (a, b, c) = (r[best_lag - 1], r[best_lag], r[best_lag + 1]);
+        let den = a - 2.0 * b + c;
+        let off = if den.abs() > 1e-9 { (0.5 * (a - c) / den).clamp(-1.0, 1.0) } else { 0.0 };
+        let est = 60.0 * TEMPO_FS / (best_lag as f32 + off);
+        self.update(est);
+    }
+
+    /// Smooths small changes, and only accepts big ones after they have been
+    /// seen repeatedly (octave / triplet-type changes need the most proof).
+    fn update(&mut self, est: f32) {
+        if self.bpm <= 0.0 {
+            if self.cand > 0.0 && (est - self.cand).abs() / self.cand < 0.04 {
+                self.cand_n += 1;
+                self.cand = 0.5 * (self.cand + est);
+            } else {
+                self.cand = est;
+                self.cand_n = 1;
+            }
+            if self.cand_n >= 2 {
+                self.bpm = self.cand;
+                self.cand = 0.0;
+                self.cand_n = 0;
+            }
+            return;
+        }
+        let rel = (est - self.bpm).abs() / self.bpm;
+        if rel < 0.03 {
+            self.bpm += (est - self.bpm) * 0.25;
+            self.cand = 0.0;
+            self.cand_n = 0;
+            return;
+        }
+        let ratio = est / self.bpm;
+        let related = [2.0f32, 0.5, 1.5, 2.0 / 3.0, 4.0 / 3.0, 0.75]
+            .iter()
+            .any(|q| (ratio - q).abs() < 0.06 * q);
+        let need = if related { 8 } else { 4 };
+        if self.cand > 0.0 && (est - self.cand).abs() / self.cand < 0.03 {
+            self.cand_n += 1;
+            self.cand = 0.5 * (self.cand + est);
+        } else {
+            self.cand = est;
+            self.cand_n = 1;
+        }
+        if self.cand_n >= need {
+            self.bpm = self.cand;
+            self.cand = 0.0;
+            self.cand_n = 0;
+        }
     }
 }
 
@@ -796,6 +985,11 @@ struct AudioProcessor {
     last_fired_beat_time: f64,
     tap_times: VecDeque<Instant>,
     tap_override_until: Option<Instant>,
+    tempo: TempoTracker,
+    /// Fixed tempo from the settings (0 = auto-detect).
+    manual_bpm: f32,
+    /// Consecutive real beats that landed away from the predicted beat.
+    offbeat_run: u32,
 
     band_levels: [f32; 4],
     waveform_buf: Vec<f32>,
@@ -874,6 +1068,9 @@ impl AudioProcessor {
             last_fired_beat_time: f64::NEG_INFINITY,
             tap_times: VecDeque::with_capacity(8),
             tap_override_until: None,
+            tempo: TempoTracker::new(),
+            manual_bpm: 0.0,
+            offbeat_run: 0,
             band_levels: [0.0; 4],
             waveform_buf: vec![0.0; WAVEFORM_LEN],
             waveform_pos: 0,
@@ -1028,6 +1225,8 @@ impl AudioProcessor {
         self.waveform_buf.fill(0.0);
         self.spectrum_row.fill(0.0);
         self.beat_times.clear();
+        self.tempo.reset();
+        self.offbeat_run = 0;
         self.bpm_raw = 0.0;
         self.tap_bpm = 0.0;
         self.next_beat_time = f64::INFINITY;
@@ -1078,16 +1277,20 @@ impl AudioProcessor {
         self.frame_ring_count = 0;
     }
 
+    /// Priority: a recent tap-tempo override, then the manual tempo from the
+    /// settings, then the detected tempo. The BPM multiplier applies to the
+    /// tapped and detected tempos; a manual tempo is used exactly as entered.
     fn effective_bpm(&self) -> f32 {
-        let bpm = if self.tap_override_until
+        let tapped = self.tap_override_until
             .map(|u| u.elapsed() < Duration::from_secs(5))
-            .unwrap_or(false) && self.tap_bpm > 20.0
-        {
-            self.tap_bpm
-        } else {
-            self.bpm_raw
-        };
-        bpm * self.bpm_multiplier.factor()
+            .unwrap_or(false) && self.tap_bpm > 20.0;
+        if tapped {
+            return self.tap_bpm * self.bpm_multiplier.factor();
+        }
+        if self.manual_bpm > 20.0 {
+            return self.manual_bpm;
+        }
+        self.bpm_raw * self.bpm_multiplier.factor()
     }
 
     fn process(
@@ -1100,6 +1303,7 @@ impl AudioProcessor {
         self.update_initial_state(s);
         self.time_elapsed += dt as f64;
         self.bpm_multiplier = s.bpm_multiplier;
+        self.manual_bpm = if s.manual_bpm_enabled { s.manual_bpm.clamp(20.0, 300.0) } else { 0.0 };
         self.chroma_enabled = s.chroma_enabled;
 
         let n_fft = self.cached_fft_size;
@@ -1321,30 +1525,56 @@ impl AudioProcessor {
     }
 
     fn compute_chroma_and_pitch(&mut self, bin_width: f32, nyquist: usize, norm: f32) {
+        // Chroma is built from spectral *peaks* only. Every partial is counted
+        // once, at its interpolated frequency, so the result does not depend on
+        // how many FFT bins happen to fall into each pitch class. (Summing all
+        // bins in the dB domain, as before, made all 12 classes nearly equal.)
+        // Below ~200 Hz a 2048-point FFT can't resolve semitones; skip it.
+        const MIN_HZ: f32 = 200.0;
+        const MAX_HZ: f32 = 4000.0;
         let mut chroma = [0.0f32; 12];
         let mut best_mag = 0.0f32;
         let mut best_bin = 0usize;
-        // Below ~200 Hz a 2048-point FFT can't resolve semitones; skip those
-        // bins instead of smearing them into the wrong pitch class.
-        const MIN_HZ: f32 = 200.0;
-        const MAX_HZ: f32 = 4000.0;
-        for k in 1..nyquist {
-            let freq = k as f32 * bin_width;
-            if freq < MIN_HZ || freq > MAX_HZ { continue; }
-            let lin_mag = self.output_buffer[k].norm() * norm;
-            if lin_mag < 1e-7 { continue; }
-            // Accumulate in the dB domain so dense treble bins don't swamp
-            // the sparse bass bins.
-            let db = 20.0 * lin_mag.max(1e-9).log10();
-            let weight = (db + 100.0).max(0.0);
-            let midi = 69.0 + 12.0 * (freq / 440.0).log2();
-            let pc = ((midi.round() as i32).rem_euclid(12)) as usize;
-            chroma[pc] += weight;
-            if lin_mag > best_mag { best_mag = lin_mag; best_bin = k; }
-        }
-        let max = chroma.iter().cloned().fold(0.0f32, f32::max);
-        if max > 1e-6 {
-            for v in chroma.iter_mut() { *v /= max; }
+
+        let k_lo = ((MIN_HZ * 0.75 / bin_width) as usize).max(2);
+        let k_hi = (((MAX_HZ * 1.1) / bin_width) as usize + 1).min(nyquist.saturating_sub(2));
+        if k_hi > k_lo + 2 {
+            // mags[i] belongs to FFT bin (k_lo - 1 + i)
+            let mags: Vec<f32> = (k_lo - 1..=k_hi + 1)
+                .map(|k| self.output_buffer[k].norm() * norm)
+                .collect();
+            for k in k_lo..=k_hi {
+                let freq = k as f32 * bin_width;
+                if freq < MIN_HZ || freq > MAX_HZ { continue; }
+                let m = mags[k - k_lo + 1];
+                if m > best_mag { best_mag = m; best_bin = k; }
+            }
+            if best_mag > 1.0e-4 {
+                let floor = best_mag * 0.02; // ignore anything >34 dB below the loudest peak
+                for k in k_lo..=k_hi {
+                    let i = k - k_lo + 1;
+                    let m = mags[i];
+                    if m < floor || !(m > mags[i - 1] && m >= mags[i + 1]) { continue; }
+                    let a_l = mags[i - 1].max(1e-12).ln();
+                    let b_l = m.max(1e-12).ln();
+                    let c_l = mags[i + 1].max(1e-12).ln();
+                    let den = a_l - 2.0 * b_l + c_l;
+                    let off = if den.abs() > 1e-9 { (0.5 * (a_l - c_l) / den).clamp(-0.5, 0.5) } else { 0.0 };
+                    let freq = (k as f32 + off) * bin_width;
+                    if freq < MIN_HZ || freq > MAX_HZ { continue; }
+                    let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+                    let lo = midi.floor();
+                    let frac = midi - lo;
+                    let pc = (lo as i32).rem_euclid(12) as usize;
+                    let w = m.sqrt();
+                    chroma[pc] += w * (1.0 - frac);
+                    chroma[(pc + 1) % 12] += w * frac;
+                }
+                let max = chroma.iter().cloned().fold(0.0f32, f32::max);
+                if max > 1e-9 {
+                    for v in chroma.iter_mut() { *v /= max; }
+                }
+            }
         }
         self.chroma = chroma;
 
@@ -1442,6 +1672,13 @@ impl AudioProcessor {
             s.beat_focus,
         );
 
+        // Tempo from the periodicity of the onset strength. Runs regardless of
+        // tap / manual overrides so a good estimate is ready when they end.
+        self.tempo.feed(self.time_elapsed, self.onset_detector.last_strength);
+        if self.tempo.bpm > 0.0 {
+            self.bpm_raw = self.tempo.bpm;
+        }
+
         let since_last_real = self.time_elapsed
             - self.beat_times.back().copied().unwrap_or(f64::NEG_INFINITY);
         // Real detection runs even during a tap-tempo override, so
@@ -1451,7 +1688,10 @@ impl AudioProcessor {
         if is_real_beat {
             self.beat_times.push_back(self.time_elapsed);
             while self.beat_times.len() > MAX_BEATS { self.beat_times.pop_front(); }
-            self.recompute_bpm();
+            // Gap-averaging is only a quick first guess until the tracker locks.
+            if self.tempo.bpm <= 0.0 && self.bpm_raw <= 0.0 {
+                self.recompute_bpm();
+            }
         }
         while let Some(&t) = self.beat_times.front() {
             if self.time_elapsed - t > BEAT_MEMORY_S { self.beat_times.pop_front(); } else { break; }
@@ -1473,11 +1713,24 @@ impl AudioProcessor {
             let phase_error = if self.phase < 0.5 { self.phase } else { 1.0 - self.phase };
             let on_beat = phase_error < 0.35;
             if eff_bpm > 20.0 {
-                if s.bpm_lock_enabled {
+                // A manual tempo has no beat grid of its own, so the phase is
+                // always pulled onto the detected beats, lock or not.
+                let lock_phase = s.bpm_lock_enabled || self.manual_bpm > 20.0;
+                if lock_phase {
                     if on_beat {
                         let error = if self.phase < 0.5 { -self.phase } else { 1.0 - self.phase };
                         self.phase = (self.phase + error * s.bpm_phase_smoothing.clamp(0.0, 1.0))
                             .rem_euclid(1.0);
+                        self.offbeat_run = 0;
+                    } else {
+                        // Beats keep landing far from the predicted grid: the
+                        // phase is simply wrong (e.g. right after start-up), so
+                        // re-anchor it instead of waiting for drift to fix it.
+                        self.offbeat_run += 1;
+                        if self.offbeat_run >= 4 {
+                            self.phase = 0.0;
+                            self.offbeat_run = 0;
+                        }
                     }
                 } else {
                     self.phase = 0.0;
@@ -1947,6 +2200,68 @@ mod tests {
         let mid = a.lerp_toward(&b, 0.5);
         assert!((mid.values[0] - 0.5).abs() < 1e-6);
         assert!((mid.values[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tempo_tracker_locks_to_steady_pulse() {
+        let mut tr = TempoTracker::new();
+        let spb = 60.0 / 128.0;
+        let mut next = 0.0f64;
+        for k in 0..(60 * 20) {
+            let t = k as f64 / 60.0;
+            let mut strength = 0.05;
+            if t >= next { strength = 1.0; next += spb; }
+            tr.feed(t, strength);
+        }
+        assert!((tr.bpm - 128.0).abs() < 3.0, "bpm = {}", tr.bpm);
+    }
+
+    #[test]
+    fn tempo_tracker_ignores_unstructured_noise() {
+        let mut tr = TempoTracker::new();
+        let mut state = 12345u32;
+        for k in 0..(60 * 30) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let strength = (state >> 16) as f32 / 65535.0 * 0.3;
+            tr.feed(k as f64 / 60.0, strength);
+        }
+        assert!(tr.bpm == 0.0, "locked onto noise: {}", tr.bpm);
+    }
+
+    #[test]
+    fn manual_tempo_overrides_detection_and_ignores_multiplier() {
+        let mut p = AudioProcessor::new(48000.0);
+        p.bpm_raw = 100.0;
+        assert!((p.effective_bpm() - 100.0).abs() < 1e-3);
+        p.manual_bpm = 90.0;
+        p.bpm_multiplier = BpmMultiplier::Double;
+        assert!((p.effective_bpm() - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn chroma_lights_the_notes_of_a_triad() {
+        let sr = 48000.0f32;
+        let mut p = AudioProcessor::new(sr);
+        let mut s = AudioSettings::default();
+        s.fft_size = 2048;
+        s.dc_block = false;
+        s.agc_enabled = false;
+        s.chroma_enabled = true;
+        let n = 4096;
+        let mut buf = vec![0.0f32; n];
+        for &f in &[261.63f32, 329.63, 392.0] {
+            for h in 1..=3 {
+                for i in 0..n {
+                    buf[i] += 0.1 / h as f32
+                        * (2.0 * std::f32::consts::PI * f * h as f32 * i as f32 / sr).sin();
+                }
+            }
+        }
+        let frame = p.process(&buf, &s, 1.0 / 60.0, Instant::now()).unwrap();
+        let c = frame.chroma;
+        // C = 0, E = 4, G = 7 must clearly beat C# = 1, F = 5, A# = 10
+        assert!(c[0] > 0.5 && c[4] > 0.5 && c[7] > 0.5, "chroma = {:?}", c);
+        assert!(c[1] < 0.3 && c[5] < 0.3 && c[10] < 0.3, "chroma = {:?}", c);
     }
 
     #[test]
