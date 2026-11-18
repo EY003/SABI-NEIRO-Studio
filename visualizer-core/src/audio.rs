@@ -62,6 +62,8 @@ pub struct BarFrame {
     pub dominant_pitch_midi: f32,
     pub waveform: Vec<f32>,
     pub spectrum_row: Vec<f32>,
+    /// Bar-aligned values *before* ballistics (same scale as `values`).
+    pub instant: Vec<f32>,
     pub capture_instant: Instant,
 }
 
@@ -77,6 +79,7 @@ impl BarFrame {
             dominant_pitch_hz: 0.0, dominant_pitch_midi: 0.0,
             waveform: vec![0.0; WAVEFORM_LEN],
             spectrum_row: vec![0.0; SPECTRUM_ROW_LEN],
+            instant: vec![0.0; num_bars],
             capture_instant: Instant::now(),
         }
     }
@@ -110,6 +113,7 @@ impl BarFrame {
             dominant_pitch_midi: next.dominant_pitch_midi,
             waveform: next.waveform.clone(),
             spectrum_row: blend_vec(&self.spectrum_row, &next.spectrum_row),
+            instant: blend_vec(&self.instant, &next.instant),
             capture_instant: next.capture_instant,
         }
     }
@@ -1045,8 +1049,18 @@ impl AudioProcessor {
             dominant_pitch_hz: 0.0, dominant_pitch_midi: 0.0,
             waveform: vec![0.0; WAVEFORM_LEN],
             spectrum_row: vec![0.0; SPECTRUM_ROW_LEN],
+            instant: vec![0.0; self.bar_values.len()],
             capture_instant: Instant::now(),
         }
+    }
+
+    /// Waveform ring buffer rotated so index 0 is the oldest sample.
+    fn ordered_waveform(&self) -> Vec<f32> {
+        let pos = self.waveform_pos.min(self.waveform_buf.len());
+        let mut out = Vec::with_capacity(self.waveform_buf.len());
+        out.extend_from_slice(&self.waveform_buf[pos..]);
+        out.extend_from_slice(&self.waveform_buf[..pos]);
+        out
     }
 
     fn resize_bar_state(&mut self, n: usize) {
@@ -1104,8 +1118,9 @@ impl AudioProcessor {
                 chroma: self.chroma,
                 dominant_pitch_hz: self.dominant_pitch_hz,
                 dominant_pitch_midi: self.dominant_pitch_midi,
-                waveform: self.waveform_buf.clone(),
+                waveform: self.ordered_waveform(),
                 spectrum_row: self.spectrum_row.clone(),
+                instant: self.smoothed.clone(),
                 capture_instant,
             });
         }
@@ -1298,8 +1313,9 @@ impl AudioProcessor {
             chroma: self.chroma,
             dominant_pitch_hz: self.dominant_pitch_hz,
             dominant_pitch_midi: self.dominant_pitch_midi,
-            waveform: self.waveform_buf.clone(),
+            waveform: self.ordered_waveform(),
             spectrum_row: self.spectrum_row.clone(),
+            instant: self.smoothed.clone(),
             capture_instant,
         })
     }
@@ -1658,7 +1674,7 @@ fn make_bin_ranges(
     ranges
 }
 
-fn compute_bar_centers_hz(
+pub fn compute_bar_centers_hz(
     num_bars: usize, scaling: FrequencyScaling, min_freq: f32, max_freq: f32,
 ) -> Vec<f32> {
     if num_bars == 0 || max_freq <= min_freq { return Vec::new(); }
@@ -1921,7 +1937,7 @@ mod tests {
             onsets: Onsets { kick: false, snare: false, hat: false, flux: 0.0 },
             rms: 0.0, peak: 0.0, band_levels: [0.0; 4], chroma: [0.0; 12],
             dominant_pitch_hz: 0.0, dominant_pitch_midi: 0.0,
-            waveform: vec![], spectrum_row: vec![0.0; 4],
+            waveform: vec![], spectrum_row: vec![0.0; 4], instant: vec![0.0, 1.0],
             capture_instant: Instant::now(),
         };
         let b = BarFrame {
@@ -1931,6 +1947,29 @@ mod tests {
         let mid = a.lerp_toward(&b, 0.5);
         assert!((mid.values[0] - 0.5).abs() < 1e-6);
         assert!((mid.values[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn waveform_is_oldest_to_newest_even_when_ring_wraps() {
+        let mut p = AudioProcessor::new(48_000.0);
+        // Pretend the ring wrapped: write head in the middle of the buffer.
+        for (i, v) in p.waveform_buf.iter_mut().enumerate() { *v = i as f32; }
+        p.waveform_pos = 100;
+        let w = p.ordered_waveform();
+        assert_eq!(w.len(), WAVEFORM_LEN);
+        assert_eq!(w[0], 100.0);
+        assert_eq!(w[WAVEFORM_LEN - 1], 99.0);
+        assert!(w.windows(2).all(|p| p[1] == p[0] + 1.0 || p[0] == (WAVEFORM_LEN - 1) as f32));
+    }
+
+    #[test]
+    fn frame_exposes_pre_ballistics_bars_with_bar_count() {
+        let mut p = AudioProcessor::new(48_000.0);
+        let mut s = AudioSettings::default();
+        s.num_bars = 32;
+        let buf = vec![0.1f32; 4096];
+        let f = p.process(&buf, &s, 1.0 / 60.0, Instant::now()).unwrap();
+        assert_eq!(f.instant.len(), f.values.len());
     }
 
     #[test]
