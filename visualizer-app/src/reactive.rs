@@ -23,8 +23,9 @@ use std::time::Instant;
 use eframe::egui;
 use visualizer_core::audio::{compute_bar_centers_hz, BarFrame};
 use visualizer_core::config::{
-    AppConfig, BandColorMode, BarInterpolation, FlashMode, FrequencyDirection, FrequencyScaling,
-    GhostSource, ReactiveSettings, SweepMode, VisualizerDirection,
+    AppConfig, BandColorMode, BarInterpolation, CustomReactivePreset, FlashMode,
+    FrequencyDirection, FrequencyScaling, GhostSource, ReactivePreset, ReactiveSettings,
+    SweepMode, VisualizerDirection,
 };
 
 use super::{
@@ -113,22 +114,43 @@ impl AdaptiveRange {
 // ───────────────────────────────────────────────────────────────
 // Dynamics ("velocity") analyser
 //
-// Produces `intensity` in 0..1: how hard the music is being played
-// *relative to the track itself*. It blends three cues:
-//   loudness   – percentile rank of the short-term level inside a decaying
-//                histogram of the whole track so far (robust to outliers)
+// Produces `intensity` in 0..1: how hard the music is being played,
+// judged against what this listener has heard. Three cues are blended:
+//   loudness   – where the short-term level sits in a decaying histogram of
+//                the track so far, blended with an absolute loudness scale
 //   attack     – how sharply the level just rose (struck keys / plucks)
-//   brightness – spectral centroid vs. its own recent range (harder
-//                playing is brighter)
-// Because everything is relative to the track's own history, a quiet solo
-// piano piece uses the full range just like a loud rock track.
+//   brightness – spectral centroid vs. its own recent range
+//
+// The audio is only ever heard live, so the future of a track cannot be
+// measured. Instead the histogram starts from what the listener has
+// heard this session (or a typical-loudness prior at launch), so a quiet
+// intro reads as quiet immediately rather than as "average".
 // ───────────────────────────────────────────────────────────────
 
 const HIST_BINS: usize = 80; // 1 dB bins covering -80 .. 0 dBFS
+const SEED_S: f32 = 8.0;           // weight of the prior at the start of every track
+const SESSION_TAU_S: f32 = 1200.0; // memory of what the listener usually plays
+const PRIOR_MASS_S: f32 = 30.0;
+const PRIOR_SIGMA_DB: f32 = 9.0;
+
+fn prior_hist(center_db: f32, mass: f32) -> Vec<f32> {
+    let mut h: Vec<f32> = (0..HIST_BINS)
+        .map(|b| {
+            let db = b as f32 - 80.0;
+            (-0.5 * ((db - center_db) / PRIOR_SIGMA_DB).powi(2)).exp()
+        })
+        .collect();
+    let sum: f32 = h.iter().sum::<f32>().max(1e-6);
+    for v in h.iter_mut() { *v *= mass / sum; }
+    h
+}
 
 pub struct Dynamics {
     hist: Vec<f32>,
     total: f32,
+    session: Vec<f32>,
+    session_total: f32,
+    prior_center: f32,
     loud_fast: f32,
     loud_slow: f32,
     attack_hold: f32,
@@ -138,25 +160,59 @@ pub struct Dynamics {
 }
 
 impl Default for Dynamics {
-    fn default() -> Self {
-        Self {
-            hist: vec![0.0; HIST_BINS],
+    fn default() -> Self { Dynamics::new(-22.0) }
+}
+
+impl Dynamics {
+    fn new(center_db: f32) -> Self {
+        let session = prior_hist(center_db, PRIOR_MASS_S);
+        let mut d = Dynamics {
+            hist: Vec::new(),
             total: 0.0,
+            session,
+            session_total: PRIOR_MASS_S,
+            prior_center: center_db,
             loud_fast: -80.0,
             loud_slow: -80.0,
             attack_hold: 0.0,
             bright: AdaptiveRange::default(),
             init: false,
-            intensity: 0.5,
-        }
+            intensity: 0.0,
+        };
+        d.reset_track();
+        d
     }
-}
 
-impl Dynamics {
-    /// Forget everything learned about the current track (call on track change).
-    pub fn reset(&mut self) { *self = Dynamics::default(); }
+    /// New track: forget the track itself but start from the session's loudness profile.
+    pub fn reset_track(&mut self) {
+        let k = SEED_S / self.session_total.max(1e-6);
+        self.hist = self.session.iter().map(|v| v * k).collect();
+        self.total = self.hist.iter().sum();
+        self.attack_hold = 0.0;
+        self.bright = AdaptiveRange::default();
+        self.init = false;
+    }
+
+    /// Forget everything, including what was learned about the listener's usual loudness.
+    pub fn reset_all(&mut self) {
+        let keep = self.intensity;
+        *self = Dynamics::new(self.prior_center);
+        self.intensity = keep;
+    }
+
+    /// Called every UI frame while the audio is silent (frames stop arriving then).
+    fn relax(&mut self, dt: f32, release_ms: f32) {
+        let k = 1.0 - (-dt / (release_ms / 1000.0).max(0.005)).exp();
+        self.intensity -= self.intensity * k;
+    }
 
     fn update(&mut self, f: &BarFrame, dt: f32, rs: &ReactiveSettings) {
+        if (rs.dyn_typical_db - self.prior_center).abs() > 0.5 {
+            let keep = self.intensity;
+            *self = Dynamics::new(rs.dyn_typical_db);
+            self.intensity = keep;
+        }
+
         let db = 20.0 * f.rms.max(1e-6).log10();
         let active = db > -70.0;
         if !self.init {
@@ -183,22 +239,29 @@ impl Dynamics {
         let tau = rs.dyn_memory_s.max(5.0);
         let bright_n = self.bright.update(centroid, dt, tau, 0.08);
 
-        // Loudness percentile inside the decaying whole-track histogram.
+        // Loudness histograms: this track (decays with the memory setting) and
+        // the whole session (decays slowly).
         let decay = (-dt / tau).exp();
         for h in self.hist.iter_mut() { *h *= decay; }
         self.total *= decay;
+        let sdecay = (-dt / SESSION_TAU_S).exp();
+        for h in self.session.iter_mut() { *h *= sdecay; }
+        self.session_total *= sdecay;
+
         let bin = (self.loud_fast + 80.0).clamp(0.0, HIST_BINS as f32 - 0.001) as usize;
         if active {
             self.hist[bin] += dt;
             self.total += dt;
+            self.session[bin] += dt;
+            self.session_total += dt;
         }
-        let rank = if self.total > 1e-3 {
-            let below: f32 = self.hist[..bin].iter().sum::<f32>() + self.hist[bin] * 0.5;
-            let conf = (self.total / 4.0).clamp(0.0, 1.0); // neutral during warm-up
-            0.5 + (below / self.total - 0.5) * conf
-        } else {
-            0.5
-        };
+
+        let below: f32 = self.hist[..bin].iter().sum::<f32>() + self.hist[bin] * 0.5;
+        let rank = below / self.total.max(1e-6);
+        // Absolute scale: +-18 dB around the typical level spans the full range.
+        let abs_n = (0.5 + (self.loud_fast - rs.dyn_typical_db) / 36.0).clamp(0.0, 1.0);
+        let blend = rs.dyn_absolute_blend.clamp(0.0, 1.0);
+        let loud_n = rank + (abs_n - rank) * blend;
 
         let wl = rs.dyn_w_loudness.max(0.0);
         let wa = rs.dyn_w_attack.max(0.0);
@@ -207,9 +270,9 @@ impl Dynamics {
         let raw = if !active {
             0.0
         } else if wsum < 1e-3 {
-            rank
+            loud_n
         } else {
-            (wl * rank + wa * self.attack_hold + wb * bright_n) / wsum
+            (wl * loud_n + wa * self.attack_hold + wb * bright_n) / wsum
         };
 
         let c = rs.dyn_contrast.clamp(0.3, 4.0);
@@ -441,7 +504,10 @@ impl FxState {
                         f.dominant_pitch_hz, f.beat_envelope),
             None => (0.0, 0.0, 0.0, [0.0; 4], [0.0; 12], 0.0, 0.0),
         };
-        let activity = smoothstep(0.001, 0.01, rms);
+        let activity = smoothstep(0.0005, 0.004, rms);
+        if rs.dynamics_color && rms < 0.0003 {
+            self.dynamics.relax(dt, rs.dyn_release_ms);
+        }
         let beat_ok = bpm >= 20.0;
         let phase = phase.rem_euclid(1.0);
 
@@ -469,9 +535,9 @@ impl FxState {
             }
             self.chroma_min = mn;
             self.chroma_span = mx - mn;
-            if self.chroma_span > 0.04
+            if self.chroma_span > 0.3
                 && arg != self.key_pc
-                && self.chroma_s[arg] > self.chroma_s[self.key_pc] + 0.06
+                && self.chroma_s[arg] > self.chroma_s[self.key_pc] + 0.12
             {
                 self.key_pc = arg;
             }
@@ -555,7 +621,7 @@ impl FxState {
         ];
         let sweep_rgb = rgb01(rs.sweep_color);
         let pitch_rgb = rgb01(rs.pitch_color);
-        let tonal = self.chroma_span > 0.04;
+        let tonal = self.chroma_span > 0.3;
 
         for idx in 0..n {
             let hz = self.bar_hz.get(idx).copied().unwrap_or(1000.0);
@@ -930,291 +996,490 @@ fn note(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(12.0).color(egui::Color32::from_rgb(230, 170, 90)));
 }
 
+// Thin wrappers: every control is followed by its own help line.
+fn fx_check(ui: &mut egui::Ui, sh: bool, v: &mut bool, label: &str, help: &str) {
+    checkbox_reset(ui, v, label, false);
+    help_text(ui, sh, help);
+}
+
+fn fx_slider(
+    ui: &mut egui::Ui, sh: bool, v: &mut f32, range: std::ops::RangeInclusive<f32>,
+    label: &str, default: f32, help: &str,
+) {
+    slider_f32(ui, v, range, label, default);
+    help_text(ui, sh, help);
+}
+
+fn fx_slider_u8(ui: &mut egui::Ui, sh: bool, v: &mut u8, label: &str, default: u8, help: &str) {
+    slider_u8(ui, v, label, default);
+    help_text(ui, sh, help);
+}
+
+fn fx_color(ui: &mut egui::Ui, sh: bool, v: &mut [u8; 3], label: &str, default: [u8; 3], help: &str) {
+    color_edit_reset(ui, v, label, default);
+    help_text(ui, sh, help);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fx_combo<T: PartialEq + Copy + 'static>(
+    ui: &mut egui::Ui, sh: bool, v: &mut T, default: T, label: &str, id: &str, width: f32,
+    options: &[T], name: fn(T) -> &'static str, help: &str,
+) {
+    combo_reset(ui, v, default, label, id, width, options, name);
+    help_text(ui, sh, help);
+}
+
 impl SettingsState {
+    fn draw_reactive_preset_selector(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.config.reactive.enabled;
+        let detected = ReactivePreset::detect(&self.config.reactive);
+        let custom_match = self.config.custom_reactive_presets.iter().find(|p| {
+            let mut c = p.settings.clone();
+            c.enabled = enabled;
+            c == self.config.reactive
+        });
+        let current_label = if let Some(p) = detected {
+            p.display_name().to_string()
+        } else if let Some(p) = custom_match {
+            p.name.clone()
+        } else {
+            "Custom".to_string()
+        };
+
+        let mut chosen_builtin: Option<ReactivePreset> = None;
+        let mut chosen_custom: Option<usize> = None;
+
+        ui.horizontal(|ui| {
+            ui.label("Preset:");
+            egui::ComboBox::from_id_source("reactive_preset")
+                .selected_text(current_label)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for p in ReactivePreset::all() {
+                        if ui
+                            .selectable_label(detected == Some(p), p.display_name())
+                            .on_hover_text(p.description())
+                            .clicked()
+                        {
+                            chosen_builtin = Some(p);
+                        }
+                    }
+                    if !self.config.custom_reactive_presets.is_empty() {
+                        ui.separator();
+                        for (i, p) in self.config.custom_reactive_presets.iter().enumerate() {
+                            let active = custom_match.map(|c| c.name == p.name).unwrap_or(false);
+                            if ui.selectable_label(active, &p.name).clicked() {
+                                chosen_custom = Some(i);
+                            }
+                        }
+                    }
+                });
+        });
+        if let Some(p) = chosen_builtin {
+            p.apply(&mut self.config.reactive);
+        }
+        if let Some(i) = chosen_custom {
+            let mut s = self.config.custom_reactive_presets[i].settings.clone();
+            s.enabled = enabled;
+            self.config.reactive = s;
+        }
+        if let Some(p) = detected {
+            help_text(ui, self.config.show_help_text, p.description());
+        } else {
+            help_text(
+                ui,
+                self.config.show_help_text,
+                "Presets switch whole groups of effects on or off with tuned values. Anything you change afterwards turns the label into Custom; save it below to keep it.",
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.new_reactive_preset_name);
+            if ui.button("💾 Save as Preset").clicked() {
+                let name = if self.new_reactive_preset_name.trim().is_empty() {
+                    format!("My Look {}", self.config.custom_reactive_presets.len() + 1)
+                } else {
+                    self.new_reactive_preset_name.trim().to_string()
+                };
+                self.config.custom_reactive_presets.push(CustomReactivePreset {
+                    name,
+                    settings: self.config.reactive.clone(),
+                });
+                self.new_reactive_preset_name.clear();
+            }
+        });
+
+        let custom_list: Vec<(usize, String)> = self
+            .config
+            .custom_reactive_presets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.name.clone()))
+            .collect();
+        let mut to_remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, name) in &custom_list {
+                if ui.button(name).clicked() {
+                    let mut s = self.config.custom_reactive_presets[*i].settings.clone();
+                    s.enabled = enabled;
+                    self.config.reactive = s;
+                }
+                if ui.small_button("✖").clicked() {
+                    to_remove = Some(*i);
+                }
+            }
+        });
+        if let Some(i) = to_remove {
+            self.pending_reactive_preset_delete = Some(i);
+        }
+    }
+
     pub(crate) fn tab_reactive(&mut self, ui: &mut egui::Ui) {
-        let show_help = self.config.show_help_text;
-        let bpm_known = self.last_bpm >= 20.0;
+        let sh = self.config.show_help_text;
+        let last_bpm = self.last_bpm;
+        let bpm_known = last_bpm >= 20.0;
         let chroma_on = self.config.audio.chroma_enabled;
         let intensity = self.fx_intensity;
-        let decay_mode_gravity =
-            self.config.audio.decay_mode == visualizer_core::config::DecayMode::Gravity;
+        let gravity = self.config.audio.decay_mode == visualizer_core::config::DecayMode::Gravity;
         let mut enable_chroma = false;
-        let mut reset_memory = false;
+        let mut reset_kind: u8 = 0;
         let d = ReactiveSettings::default();
-        let r = &mut self.config.reactive;
 
+        // ── Master switch + presets ──────────────────────────────
         section_header(ui, "Reactive Effects");
+        checkbox_reset(ui, &mut self.config.reactive.enabled, "Reactive effects on", true);
+        help_text(
+            ui, sh,
+            "Master switch. When off, none of the effects below do anything and the bars are drawn exactly as before. Every effect is also off by itself until you tick it.",
+        );
+        self.draw_reactive_preset_selector(ui);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut r.enabled, "Enable reactive effects");
             if ui.button("Turn all effects off").clicked() {
-                r.onset_spikes = false; r.beat_pump = false; r.windup = false;
-                r.band_sculpt = false; r.transient_snap = false; r.beat_clock_colors = false;
-                r.phase_sweep = false; r.phase_wave = false; r.onset_flash = false;
-                r.chroma_rotate = false; r.chroma_bars = false; r.band_colors = false;
-                r.pitch_highlight = false; r.wave_wiggle = false; r.ghost_line = false;
-                r.dynamics_color = false;
+                ReactivePreset::Off.apply(&mut self.config.reactive);
             }
-            if ui.button("Reset all to defaults").clicked() {
-                *r = ReactiveSettings::default();
+            if ui.button("Reset all values to defaults").clicked() {
+                let en = self.config.reactive.enabled;
+                self.config.reactive = ReactiveSettings::default();
+                self.config.reactive.enabled = en;
             }
         });
         help_text(
-            ui,
-            show_help,
-            "Visual-only effects driven by the audio analysis. Each one is off by default and \
-             independent; combine as many as you like. Height effects may exceed the max bar \
-             height by up to 24 px.",
+            ui, sh,
+            "Effects may lift a bar up to 24 px above the maximum bar height. Right-click any slider to reset it.",
         );
-        if !bpm_known {
-            note(ui, "No tempo detected yet — phase / beat-in effects (3, 7, 8) stay idle until a BPM is found.");
+
+        // ── Tempo ────────────────────────────────────────────────
+        section_header(ui, "Tempo");
+        {
+            let a = &mut self.config.audio;
+            if last_bpm > 0.0 {
+                let src = if a.manual_bpm_enabled { "manual" } else { "auto-detected" };
+                ui.label(format!("Current tempo: {:.1} BPM ({})", last_bpm, src));
+            } else {
+                ui.label("No tempo detected yet.");
+            }
+            checkbox_reset(ui, &mut a.manual_bpm_enabled, "Manual tempo", false);
+            help_text(
+                ui, sh,
+                "Fixes the tempo instead of detecting it. Used by every beat-dependent effect (beat-clock colors, wind-up, sweep, wave, pump) and by BPM Lock. Use it when detection picks half or double time, or on music with an unclear beat. Tap Tempo still overrides it for 5 seconds.",
+            );
+            if a.manual_bpm_enabled {
+                slider_f32(ui, &mut a.manual_bpm, 40.0..=240.0, "Tempo (BPM)", 120.0);
+                help_text(
+                    ui, sh,
+                    "The beats per minute to use. The BPM Multiplier (Audio tab) does not apply to a manual tempo. The beat phase is still pulled onto the beats that are heard, so sweeps and wind-up stay in step with the music.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.small_button("÷ 2").clicked() { a.manual_bpm = (a.manual_bpm / 2.0).clamp(40.0, 240.0); }
+                    if ui.small_button("× 2").clicked() { a.manual_bpm = (a.manual_bpm * 2.0).clamp(40.0, 240.0); }
+                    if ui.small_button("− 1").clicked() { a.manual_bpm = (a.manual_bpm - 1.0).clamp(40.0, 240.0); }
+                    if ui.small_button("+ 1").clicked() { a.manual_bpm = (a.manual_bpm + 1.0).clamp(40.0, 240.0); }
+                });
+            } else if bpm_known && ui.button("Use current tempo as manual").clicked() {
+                a.manual_bpm = (last_bpm * 10.0).round() / 10.0;
+                a.manual_bpm_enabled = true;
+            }
+            if !a.manual_bpm_enabled && !bpm_known {
+                note(ui, "Beat-dependent effects stay idle until a tempo is detected or set manually.");
+            }
         }
 
-        // ══ A ═════════════════════════════════════════════════
-        section_header(ui, "A · Rhythm & Transient Geometry");
+        let r = &mut self.config.reactive;
 
-        sub_header(ui, "1 · Per-Band Onset Spikes");
-        checkbox_reset(ui, &mut r.onset_spikes, "Enable", false);
+        // ── Rhythm & transients ──────────────────────────────────
+        section_header(ui, "Rhythm & Transients");
+
+        fx_check(ui, sh, &mut r.onset_spikes, "Per-Band Onset Spikes",
+            "Each drum lifts its own part of the spectrum: kick the bass bars (20–150 Hz), snare the middle (150 Hz–2 kHz), hi-hat the treble (6–12 kHz). Gives polyrhythmic movement instead of one uniform jump.");
         if r.onset_spikes {
-            slider_f32(ui, &mut r.spike_kick, 0.0..=1.0, "Kick boost (bass bars)", d.spike_kick);
-            slider_f32(ui, &mut r.spike_snare, 0.0..=1.0, "Snare boost (mid bars)", d.spike_snare);
-            slider_f32(ui, &mut r.spike_hat, 0.0..=1.0, "Hat boost (treble bars)", d.spike_hat);
-            slider_f32(ui, &mut r.spike_decay_ms, 30.0..=600.0, "Decay (ms)", d.spike_decay_ms);
-            slider_f32(ui, &mut r.spike_softness_oct, 0.05..=1.5, "Region softness (octaves)", d.spike_softness_oct);
-            help_text(ui, show_help,
-                "Kick lifts 20–150 Hz bars, snare 150 Hz–2 kHz, hat 6–12 kHz. Each drum fires on its own, \
-                 so you get polyrhythmic movement instead of one uniform jump.");
+            fx_slider(ui, sh, &mut r.spike_kick, 0.0..=1.0, "Kick boost", d.spike_kick,
+                "How much a kick drum raises the bass bars, as a fraction of their height.");
+            fx_slider(ui, sh, &mut r.spike_snare, 0.0..=1.0, "Snare boost", d.spike_snare,
+                "How much a snare or clap raises the mid-range bars.");
+            fx_slider(ui, sh, &mut r.spike_hat, 0.0..=1.0, "Hat boost", d.spike_hat,
+                "How much a hi-hat raises the treble bars.");
+            fx_slider(ui, sh, &mut r.spike_decay_ms, 30.0..=600.0, "Decay (ms)", d.spike_decay_ms,
+                "How long a spike takes to fade. Short is snappy, long leaves a smear after the hit.");
+            fx_slider(ui, sh, &mut r.spike_softness_oct, 0.05..=1.5, "Region softness (octaves)", d.spike_softness_oct,
+                "How gradually each drum's effect fades out at the edges of its frequency range. Higher spreads a hit over more neighbouring bars.");
         }
 
-        sub_header(ui, "2 · Beat Envelope Pump");
-        checkbox_reset(ui, &mut r.beat_pump, "Enable", false);
+        fx_check(ui, sh, &mut r.beat_pump, "Beat Envelope Pump",
+            "The whole spectrum swells on each beat and relaxes in between. Beats that are only predicted by BPM Lock swell at 70 % strength, so you can see when the lock is guessing.");
         if r.beat_pump {
-            slider_f32(ui, &mut r.pump_height, 0.0..=0.5, "Height pump", d.pump_height);
-            slider_f32(ui, &mut r.pump_width, 0.0..=0.5, "Width swell", d.pump_width);
-            slider_f32(ui, &mut r.pump_peak, 0.0..=3.0, "Peak-cap swell", d.pump_peak);
-            help_text(ui, show_help,
-                "Driven by beat_envelope: real beats hit at full strength, BPM-lock predicted beats at 0.7×, \
-                 so lock drift is visible. Peak-cap swell needs Peak Hold > 0 (Audio → Ballistics). \
-                 Width swell applies to the Step shape only and can overlap neighbours slightly when Bar Gap is small.");
+            fx_slider(ui, sh, &mut r.pump_height, 0.0..=0.5, "Height pump", d.pump_height,
+                "How much taller every bar gets on the beat (0.10 = 10 %).");
+            fx_slider(ui, sh, &mut r.pump_width, 0.0..=0.5, "Width swell", d.pump_width,
+                "How much wider every bar gets on the beat. Step shape only; bars may overlap slightly if Bar Gap is small.");
+            fx_slider(ui, sh, &mut r.pump_peak, 0.0..=3.0, "Peak-cap swell", d.pump_peak,
+                "How much larger the peak-hold caps get on the beat. Needs Peak Hold above 0 in the Audio tab.");
         }
 
-        sub_header(ui, "3 · Pre-Beat Wind-Up");
-        checkbox_reset(ui, &mut r.windup, "Enable", false);
+        fx_check(ui, sh, &mut r.windup, "Pre-Beat Wind-Up",
+            "Bars squash slightly during the last part of each beat and spring back as the beat lands, so the motion starts before the sound. Needs a tempo; works best with BPM Lock or a manual tempo.");
         if r.windup {
-            slider_f32(ui, &mut r.windup_depth, 0.0..=0.3, "Compression depth", d.windup_depth);
-            slider_f32(ui, &mut r.windup_window, 0.05..=0.9, "Wind-up window (fraction of beat)", d.windup_window);
-            slider_f32(ui, &mut r.windup_brighten, 0.0..=0.6, "Brightness ramp", d.windup_brighten);
-            help_text(ui, show_help,
-                "Bars squash slightly during the last part of each beat, then release as it lands — the only \
-                 effect that reacts ahead of the beat. Works best with BPM Lock enabled.");
+            fx_slider(ui, sh, &mut r.windup_depth, 0.0..=0.3, "Compression depth", d.windup_depth,
+                "How far bars squash down just before the beat (0.05 = 5 %).");
+            fx_slider(ui, sh, &mut r.windup_window, 0.05..=0.9, "Wind-up length (fraction of a beat)", d.windup_window,
+                "How much of the beat the squash builds over. 0.3 means the last 30 % of every beat.");
+            fx_slider(ui, sh, &mut r.windup_brighten, 0.0..=0.6, "Brightness ramp", d.windup_brighten,
+                "Also brightens the bars toward white while the wind-up builds. 0 turns it off.");
         }
 
-        sub_header(ui, "4 · Sub-Bass / Band Sculpting");
-        checkbox_reset(ui, &mut r.band_sculpt, "Enable", false);
+        fx_check(ui, sh, &mut r.band_sculpt, "Band Sculpting",
+            "Slow, broad shaping from the loudness of four frequency bands. Each band is compared with its own recent range, so a band lifts when it is loud for this song, not just loud in absolute terms.");
         if r.band_sculpt {
-            slider_f32(ui, &mut r.sculpt_bass, 0.0..=0.5, "Global bass weight", d.sculpt_bass);
-            slider_f32(ui, &mut r.sculpt_region, 0.0..=0.5, "Per-region lift", d.sculpt_region);
-            slider_f32(ui, &mut r.sculpt_peak, 0.0..=3.0, "Peak-cap size by band energy", d.sculpt_peak);
-            help_text(ui, show_help,
-                "Slow macro texture from the 4 band levels, each normalised to its own recent range so it \
-                 reads as 'this band is loud right now' rather than a constant offset.");
+            fx_slider(ui, sh, &mut r.sculpt_bass, 0.0..=0.5, "Global bass weight", d.sculpt_bass,
+                "Raises every bar a little when the sub-bass is strong, so bass-heavy passages feel bigger overall.");
+            fx_slider(ui, sh, &mut r.sculpt_region, 0.0..=0.5, "Per-region lift", d.sculpt_region,
+                "Raises the bars in a frequency region when that region is strong. Neighbouring regions blend smoothly.");
+            fx_slider(ui, sh, &mut r.sculpt_peak, 0.0..=3.0, "Peak-cap size by band energy", d.sculpt_peak,
+                "Makes peak-hold caps larger in strong regions. Needs Peak Hold above 0.");
         }
 
-        sub_header(ui, "5 · Transient Snap & Flux Shimmer");
-        checkbox_reset(ui, &mut r.transient_snap, "Enable", false);
+        fx_check(ui, sh, &mut r.transient_snap, "Transient Snap & Flux Shimmer",
+            "Adds a quick snap when the signal peak jumps, and a tiny random shimmer while the spectrum is changing fast. Keep values small so bar heights still read accurately.");
         if r.transient_snap {
-            slider_f32(ui, &mut r.snap_amount, 0.0..=0.15, "Snap height", d.snap_amount);
-            slider_f32(ui, &mut r.snap_threshold, 0.1..=1.0, "Snap threshold (sample peak)", d.snap_threshold);
-            slider_f32(ui, &mut r.flux_shimmer, 0.0..=0.1, "Flux shimmer", d.flux_shimmer);
-            slider_f32(ui, &mut r.flux_outline, 0.0..=3.0, "Outline thickness by flux", d.flux_outline);
-            help_text(ui, show_help,
-                "Keep these small so bar heights still read accurately. Outline thickness only shows when \
-                 outlines are enabled (Visualizer tab).");
+            fx_slider(ui, sh, &mut r.snap_amount, 0.0..=0.15, "Snap height", d.snap_amount,
+                "How much taller all bars jump when the peak crosses the threshold.");
+            fx_slider(ui, sh, &mut r.snap_threshold, 0.1..=1.0, "Snap threshold (sample peak)", d.snap_threshold,
+                "The raw sample peak (0–1) that triggers a snap. Lower fires more often.");
+            fx_slider(ui, sh, &mut r.flux_shimmer, 0.0..=0.1, "Flux shimmer", d.flux_shimmer,
+                "Random per-bar flicker, scaled by how fast the spectrum is changing. 0 turns it off.");
+            fx_slider(ui, sh, &mut r.flux_outline, 0.0..=3.0, "Outline thickness by flux", d.flux_outline,
+                "Thickens the bar outline during busy moments. Only visible when outlines are enabled in the Visualizer tab.");
         }
 
-        // ══ B ═════════════════════════════════════════════════
-        section_header(ui, "B · Phase-Locked & Tempo-Synced Motion");
+        // ── Tempo-synced motion ──────────────────────────────────
+        section_header(ui, "Tempo-Synced Motion");
 
-        sub_header(ui, "6 · Beat-Clock Animated Colors");
-        checkbox_reset(ui, &mut r.beat_clock_colors, "Enable", false);
+        fx_check(ui, sh, &mut r.beat_clock_colors, "Beat-Clock Animated Colors",
+            "Runs the Animated color mode on the song's tempo instead of the wall clock, so all 30 motion shapes lock to the beat and follow Half/Double-Time. Without a tempo it runs at normal speed.");
         if r.beat_clock_colors {
-            slider_f32(ui, &mut r.beat_clock_beats_per_cycle, 0.5..=32.0, "Beats per color cycle", d.beat_clock_beats_per_cycle);
-            help_text(ui, show_help,
-                "Replaces the wall clock used by Colors → Animated with the song's tempo. All 30 motion \
-                 shapes lock to the beat and follow Half/Double-Time. The Motion Speed multiplier still applies. \
-                 Without a detected tempo it runs at normal speed.");
+            fx_slider(ui, sh, &mut r.beat_clock_beats_per_cycle, 0.5..=32.0, "Beats per color cycle", d.beat_clock_beats_per_cycle,
+                "How many beats one full color cycle lasts. 4 = one cycle per bar in 4/4. The Color Change Speed slider is ignored while this is on; Motion Speed still scales it.");
         }
 
-        sub_header(ui, "7 · Phase Sweep Highlight");
-        checkbox_reset(ui, &mut r.phase_sweep, "Enable", false);
+        fx_check(ui, sh, &mut r.phase_sweep, "Phase Sweep Highlight",
+            "A shine travels across the spectrum once per beat, like a metronome drawn in the bars. It follows frequency order, so in Mirrored layout it moves outward from the centre.");
         if r.phase_sweep {
-            combo_reset(ui, &mut r.sweep_mode, SweepMode::default(), "Direction", "fx_sweep_mode",
-                        170.0, &SweepMode::all(), SweepMode::display_name);
-            slider_f32(ui, &mut r.sweep_width, 0.02..=0.5, "Width (fraction of spectrum)", d.sweep_width);
-            slider_f32(ui, &mut r.sweep_strength, 0.0..=1.0, "Strength", d.sweep_strength);
-            slider_f32(ui, &mut r.sweep_lift, 0.0..=0.3, "Height lift", d.sweep_lift);
-            color_edit_reset(ui, &mut r.sweep_color, "Shine color", d.sweep_color);
-            help_text(ui, show_help,
-                "A shine walks across the spectrum once per beat (a metronome inside the bars). It follows \
-                 frequency order, so in Mirrored layout it travels outward from the centre. Respects Latency Offset.");
+            fx_combo(ui, sh, &mut r.sweep_mode, SweepMode::default(), "Direction", "fx_sweep_mode", 170.0,
+                &SweepMode::all(), SweepMode::display_name,
+                "Which way the shine travels. Ping-Pong goes there and back over one beat.");
+            fx_slider(ui, sh, &mut r.sweep_width, 0.02..=0.5, "Width", d.sweep_width,
+                "Width of the shine as a fraction of the whole spectrum.");
+            fx_slider(ui, sh, &mut r.sweep_strength, 0.0..=1.0, "Strength", d.sweep_strength,
+                "How strongly the shine color replaces the bar color at its centre.");
+            fx_slider(ui, sh, &mut r.sweep_lift, 0.0..=0.3, "Height lift", d.sweep_lift,
+                "Also raises the bars inside the shine. 0 keeps it purely a color effect.");
+            fx_color(ui, sh, &mut r.sweep_color, "Shine color", d.sweep_color,
+                "The color of the shine. White works with any palette.");
         }
 
-        sub_header(ui, "8 · Phase Wave Lean / Breathing");
-        checkbox_reset(ui, &mut r.phase_wave, "Enable", false);
+        fx_check(ui, sh, &mut r.phase_wave, "Phase Wave Lean & Breathing",
+            "A smooth wave locked to the beat phase sways the bars sideways, breathes their height and dims them slowly through each beat.");
         if r.phase_wave {
-            slider_f32(ui, &mut r.pw_sway_px, 0.0..=20.0, "Horizontal sway (px)", d.pw_sway_px);
-            slider_f32(ui, &mut r.pw_height, 0.0..=0.3, "Height wave", d.pw_height);
-            slider_f32(ui, &mut r.pw_count, 0.25..=8.0, "Waves across spectrum", d.pw_count);
-            slider_f32(ui, &mut r.pw_dim, 0.0..=0.7, "Brightness decay per beat", d.pw_dim);
-            help_text(ui, show_help,
-                "Sinusoidal sway / breathing locked to the beat phase. Brightness decay gives a clean emphasis \
-                 at the start of every beat without flashing.");
+            fx_slider(ui, sh, &mut r.pw_sway_px, 0.0..=20.0, "Horizontal sway (px)", d.pw_sway_px,
+                "How far bars lean left and right. 0 disables the sway.");
+            fx_slider(ui, sh, &mut r.pw_height, 0.0..=0.3, "Height wave", d.pw_height,
+                "How much the wave raises and lowers bar heights (0.04 = 4 %).");
+            fx_slider(ui, sh, &mut r.pw_count, 0.25..=8.0, "Waves across spectrum", d.pw_count,
+                "How many wave crests fit across the bars. Fractions give a slow tilt.");
+            fx_slider(ui, sh, &mut r.pw_dim, 0.0..=0.7, "Brightness decay per beat", d.pw_dim,
+                "Bars start each beat at full brightness and fade by this much before the next one. Gives a clean emphasis on the beat without flashing.");
         }
 
-        // ══ C ═════════════════════════════════════════════════
-        section_header(ui, "C · Spectral & Harmonic Coloring");
+        // ── Spectral & harmonic color ────────────────────────────
+        section_header(ui, "Spectral & Harmonic Color");
 
-        sub_header(ui, "9 · Per-Band Onset Flash");
-        checkbox_reset(ui, &mut r.onset_flash, "Enable", false);
+        fx_check(ui, sh, &mut r.onset_flash, "Per-Band Onset Flash",
+            "Colors flash on the bars of whichever drum just hit (kick = bass, snare = mid, hat = treble). Only color changes; bar heights are untouched.");
         if r.onset_flash {
-            combo_reset(ui, &mut r.flash_mode, FlashMode::default(), "Flash style", "fx_flash_mode",
-                        230.0, &FlashMode::all(), FlashMode::display_name);
-            slider_f32(ui, &mut r.flash_strength, 0.0..=1.0, "Strength", d.flash_strength);
-            slider_f32(ui, &mut r.flash_decay_ms, 40.0..=1000.0, "Decay (ms)", d.flash_decay_ms);
+            fx_combo(ui, sh, &mut r.flash_mode, FlashMode::default(), "Flash style", "fx_flash_mode", 230.0,
+                &FlashMode::all(), FlashMode::display_name,
+                "Brighten lightens the current color toward white; Flash colors paints each drum in its own color.");
+            fx_slider(ui, sh, &mut r.flash_strength, 0.0..=1.0, "Strength", d.flash_strength,
+                "How strongly the flash covers the bar color at its peak.");
+            fx_slider(ui, sh, &mut r.flash_decay_ms, 40.0..=1000.0, "Decay (ms)", d.flash_decay_ms,
+                "How long the flash takes to fade out.");
             if r.flash_mode == FlashMode::Color {
-                color_edit_reset(ui, &mut r.flash_colors[0], "Kick color", d.flash_colors[0]);
-                color_edit_reset(ui, &mut r.flash_colors[1], "Snare color", d.flash_colors[1]);
-                color_edit_reset(ui, &mut r.flash_colors[2], "Hat color", d.flash_colors[2]);
+                fx_color(ui, sh, &mut r.flash_colors[0], "Kick color", d.flash_colors[0], "Flash color for kick drums.");
+                fx_color(ui, sh, &mut r.flash_colors[1], "Snare color", d.flash_colors[1], "Flash color for snares and claps.");
+                fx_color(ui, sh, &mut r.flash_colors[2], "Hat color", d.flash_colors[2], "Flash color for hi-hats.");
             }
-            help_text(ui, show_help, "Brightness/colour only — bar geometry is untouched.");
         }
 
-        sub_header(ui, "10 · Chroma Wheel & Chord Lighting");
         if !chroma_on {
             ui.horizontal(|ui| {
-                note(ui, "Chroma analysis is off (Audio → Chroma).");
+                note(ui, "Chroma analysis is off — the two options below need it.");
                 if ui.small_button("Turn it on").clicked() { enable_chroma = true; }
             });
         }
-        checkbox_reset(ui, &mut r.chroma_rotate, "Palette rotation (follows key / chord)", false);
+        fx_check(ui, sh, &mut r.chroma_rotate, "Key-Following Palette Rotation",
+            "The whole palette rotates in hue to follow the strongest note (30° per semitone), so harmonic changes show up as color changes. It glides along the shortest path instead of jumping.");
         if r.chroma_rotate {
-            slider_f32(ui, &mut r.chroma_rotate_amount, 0.0..=1.0, "Rotation amount", d.chroma_rotate_amount);
-            slider_f32(ui, &mut r.chroma_rotate_speed, 10.0..=720.0, "Rotation speed (°/s)", d.chroma_rotate_speed);
-            help_text(ui, show_help,
-                "The palette's hue rotates by 30° per pitch class of the strongest note. It glides along the \
-                 shortest path instead of jumping when the chord changes.");
+            fx_slider(ui, sh, &mut r.chroma_rotate_amount, 0.0..=1.0, "Rotation amount", d.chroma_rotate_amount,
+                "How much of the full rotation is applied. 1 = the full 30° per semitone, lower keeps colors closer to your palette.");
+            fx_slider(ui, sh, &mut r.chroma_rotate_speed, 10.0..=720.0, "Rotation speed (°/s)", d.chroma_rotate_speed,
+                "How fast the hue moves to a new key. Low is calm and drifting, high follows every chord change.");
         }
-        checkbox_reset(ui, &mut r.chroma_bars, "Per-bar pitch-class lighting", false);
+        fx_check(ui, sh, &mut r.chroma_bars, "Per-Bar Note Lighting",
+            "Bars whose pitch class is sounding light up, so chords and melodies become visible across octaves. Covers bars between 200 Hz and 4 kHz, the range chroma analyses.");
         if r.chroma_bars {
-            slider_f32(ui, &mut r.chroma_tint, 0.0..=1.0, "Pitch-class hue tint", d.chroma_tint);
-            slider_f32(ui, &mut r.chroma_brighten, 0.0..=1.0, "Brighten active notes", d.chroma_brighten);
-            slider_f32(ui, &mut r.chroma_contrast, 0.5..=6.0, "Contrast", d.chroma_contrast);
-            help_text(ui, show_help,
-                "Bars whose pitch class is sounding light up (only bars between 200 Hz and 4 kHz, the range \
-                 chroma analyses). Color only — spectral accuracy stays intact.");
+            fx_slider(ui, sh, &mut r.chroma_tint, 0.0..=1.0, "Pitch-class hue tint", d.chroma_tint,
+                "Tints sounding notes with a color unique to each of the 12 pitch classes.");
+            fx_slider(ui, sh, &mut r.chroma_brighten, 0.0..=1.0, "Brighten sounding notes", d.chroma_brighten,
+                "Lightens sounding notes toward white.");
+            fx_slider(ui, sh, &mut r.chroma_contrast, 0.5..=6.0, "Contrast", d.chroma_contrast,
+                "Higher lights only the strongest notes; lower lights everything that is faintly present.");
         }
 
-        sub_header(ui, "11 · Live 4-Band Color Blending");
-        checkbox_reset(ui, &mut r.band_colors, "Enable", false);
+        fx_check(ui, sh, &mut r.band_colors, "Live 4-Band Color Blending",
+            "Four colors, one per frequency band, are mixed according to how loud each band is right now. Needs no beat detection.");
         if r.band_colors {
-            combo_reset(ui, &mut r.band_color_mode, BandColorMode::default(), "Mode", "fx_band_color_mode",
-                        230.0, &BandColorMode::all(), BandColorMode::display_name);
-            slider_f32(ui, &mut r.band_color_strength, 0.0..=1.0, "Strength", d.band_color_strength);
-            slider_f32(ui, &mut r.band_color_sharpness, 0.5..=4.0, "Sharpness", d.band_color_sharpness);
-            slider_f32(ui, &mut r.band_color_spatial, 0.0..=1.0, "Spatial (per-region) amount", d.band_color_spatial);
-            let names = ["Sub (20–100 Hz)", "Low (100–500 Hz)", "Mid (0.5–2 kHz)", "High (2–8 kHz)"];
+            fx_combo(ui, sh, &mut r.band_color_mode, BandColorMode::default(), "Mode", "fx_band_color_mode", 230.0,
+                &BandColorMode::all(), BandColorMode::display_name,
+                "Blend mixes all four colors into the bars. Warm/Cool only adds a warm glow from the Sub color and a cool glow from the High color.");
+            fx_slider(ui, sh, &mut r.band_color_strength, 0.0..=1.0, "Strength", d.band_color_strength,
+                "How strongly the band colors show over your palette.");
+            fx_slider(ui, sh, &mut r.band_color_sharpness, 0.5..=4.0, "Sharpness", d.band_color_sharpness,
+                "Higher makes the loudest band dominate; lower blends the bands more evenly.");
+            fx_slider(ui, sh, &mut r.band_color_spatial, 0.0..=1.0, "Spatial amount", d.band_color_spatial,
+                "0 tints every bar the same. Higher tints each bar mostly by its own frequency region, so bass colors stay on the bass side.");
+            let names = ["Sub color (20–100 Hz)", "Low color (100–500 Hz)", "Mid color (0.5–2 kHz)", "High color (2–8 kHz)"];
             for b in 0..4 {
-                color_edit_reset(ui, &mut r.band_color_list[b], names[b], d.band_color_list[b]);
+                fx_color(ui, sh, &mut r.band_color_list[b], names[b], d.band_color_list[b],
+                    "Color used for this band.");
             }
-            help_text(ui, show_help,
-                "Blend: the four colors are mixed by how loud each band is. Warm/Cool: additive warm tint from \
-                 Sub and cool tint from High. Spatial = 0 tints all bars equally; higher values tint each bar by \
-                 its own frequency region. No beat detection needed.");
         }
 
-        // ══ D ═════════════════════════════════════════════════
-        section_header(ui, "D · Pitch & Raw-Signal Detail");
+        // ── Pitch & signal detail ────────────────────────────────
+        section_header(ui, "Pitch & Signal Detail");
 
-        sub_header(ui, "12 · Dominant Pitch Highlight & Harmonics");
         if !chroma_on {
             ui.horizontal(|ui| {
-                note(ui, "Pitch tracking needs chroma analysis (Audio → Chroma).");
+                note(ui, "Pitch tracking needs chroma analysis.");
                 if ui.small_button("Turn it on").clicked() { enable_chroma = true; }
             });
         }
-        checkbox_reset(ui, &mut r.pitch_highlight, "Enable", false);
+        fx_check(ui, sh, &mut r.pitch_highlight, "Dominant Pitch Highlight",
+            "Marks the bar nearest the loudest tone (200 Hz–4 kHz): good for following a lead voice or solo instrument. It glides between notes and holds briefly when the pitch drops out.");
         if r.pitch_highlight {
-            color_edit_reset(ui, &mut r.pitch_color, "Accent color", d.pitch_color);
-            slider_f32(ui, &mut r.pitch_strength, 0.0..=1.0, "Color strength", d.pitch_strength);
-            slider_f32(ui, &mut r.pitch_width_bars, 0.5..=8.0, "Highlight width (bars)", d.pitch_width_bars);
-            slider_f32(ui, &mut r.pitch_cap_px, 0.0..=12.0, "Accent cap thickness (px)", d.pitch_cap_px);
-            checkbox_reset(ui, &mut r.pitch_outline, "Outline highlighted bars", false);
-            checkbox_reset(ui, &mut r.pitch_harmonics, "Emphasise 2× and 3× harmonics", false);
+            fx_color(ui, sh, &mut r.pitch_color, "Accent color", d.pitch_color,
+                "Color of the highlight, cap and outline.");
+            fx_slider(ui, sh, &mut r.pitch_strength, 0.0..=1.0, "Color strength", d.pitch_strength,
+                "How strongly the accent color covers the highlighted bars.");
+            fx_slider(ui, sh, &mut r.pitch_width_bars, 0.5..=8.0, "Highlight width (bars)", d.pitch_width_bars,
+                "How many bars the highlight spreads over. Small is precise, large is a soft glow.");
+            fx_slider(ui, sh, &mut r.pitch_cap_px, 0.0..=12.0, "Accent cap thickness (px)", d.pitch_cap_px,
+                "A marker drawn on top of the highlighted bars. It does not need Peak Hold. 0 hides it.");
+            fx_check(ui, sh, &mut r.pitch_outline, "Outline highlighted bars",
+                "Draws a thin outline around the highlighted bars.");
+            fx_check(ui, sh, &mut r.pitch_harmonics, "Emphasise harmonics",
+                "Also marks the bars at 2× and 3× the pitch, showing the overtone series of the note.");
             if r.pitch_harmonics {
-                slider_f32(ui, &mut r.pitch_harmonic_strength, 0.0..=1.0, "Harmonic strength", d.pitch_harmonic_strength);
+                fx_slider(ui, sh, &mut r.pitch_harmonic_strength, 0.0..=1.0, "Harmonic strength", d.pitch_harmonic_strength,
+                    "How strong the harmonic marks are compared with the main one.");
             }
-            slider_f32(ui, &mut r.pitch_hold_ms, 0.0..=1000.0, "Hold when pitch drops out (ms)", d.pitch_hold_ms);
-            slider_f32(ui, &mut r.pitch_glide_ms, 5.0..=300.0, "Glide time (ms)", d.pitch_glide_ms);
-            help_text(ui, show_help,
-                "Marks the bar nearest the loudest tone (200 Hz–4 kHz) — handy for tracking a lead voice or solo \
-                 instrument. The accent cap is drawn independently of Peak Hold.");
+            fx_slider(ui, sh, &mut r.pitch_hold_ms, 0.0..=1000.0, "Hold when pitch drops out (ms)", d.pitch_hold_ms,
+                "How long the highlight stays on the last note when no clear pitch is found. Prevents flicker on sustained notes.");
+            fx_slider(ui, sh, &mut r.pitch_glide_ms, 5.0..=300.0, "Glide time (ms)", d.pitch_glide_ms,
+                "How quickly the highlight slides to a new note. Low snaps, high slurs between notes.");
         }
 
-        sub_header(ui, "13 · Waveform Tip Wiggle");
-        checkbox_reset(ui, &mut r.wave_wiggle, "Enable", false);
+        fx_check(ui, sh, &mut r.wave_wiggle, "Waveform Tip Wiggle",
+            "The raw waveform (last 1024 samples) is laid along the bars so their tips vibrate with the audio signal. Works in Step and Smooth shapes; Smooth looks best.");
         if r.wave_wiggle {
-            slider_f32(ui, &mut r.wiggle_amount, 0.0..=0.15, "Tip wiggle (fraction of bar height)", d.wiggle_amount);
-            slider_f32(ui, &mut r.wiggle_x_px, 0.0..=6.0, "Horizontal micro-vibration (px)", d.wiggle_x_px);
-            if decay_mode_gravity {
-                note(ui, "Decay Mode is Gravity — the wiggle reads best with Linear or Exponential decay.");
+            fx_slider(ui, sh, &mut r.wiggle_amount, 0.0..=0.15, "Tip wiggle (fraction of bar height)", d.wiggle_amount,
+                "How far the tips move, relative to each bar's own height. Silent bars stay still.");
+            fx_slider(ui, sh, &mut r.wiggle_x_px, 0.0..=6.0, "Horizontal vibration (px)", d.wiggle_x_px,
+                "Also shakes bars sideways by this many pixels.");
+            if gravity {
+                note(ui, "Decay Mode is Gravity: the wiggle reads best with Linear or Exponential decay.");
             }
-            help_text(ui, show_help,
-                "The raw waveform (last 1024 samples) is laid along the bars so the tips visibly vibrate with \
-                 the audio signal. Works in Step and Smooth shapes; Smooth looks best.");
         }
 
-        sub_header(ui, "14 · Raw Spectrum Ghost Line");
-        checkbox_reset(ui, &mut r.ghost_line, "Enable", false);
+        fx_check(ui, sh, &mut r.ghost_line, "Spectrum Ghost Line",
+            "A thin line showing the spectrum before attack/decay smoothing, so you see transients before the bars catch up.");
         if r.ghost_line {
-            combo_reset(ui, &mut r.ghost_source, GhostSource::default(), "Source", "fx_ghost_source",
-                        250.0, &GhostSource::all(), GhostSource::display_name);
-            slider_f32(ui, &mut r.ghost_thickness, 0.5..=6.0, "Thickness (px)", d.ghost_thickness);
-            slider_u8(ui, &mut r.ghost_opacity, "Opacity", d.ghost_opacity);
-            slider_f32(ui, &mut r.ghost_gain, 0.25..=2.0, "Height gain", d.ghost_gain);
-            color_edit_reset(ui, &mut r.ghost_color, "Line color", d.ghost_color);
-            help_text(ui, show_help,
-                "A thin line showing the spectrum before attack/decay smoothing, so you see transients before \
-                 the bars catch up. 'Pre-ballistics bars' shares the bars' exact scale and frequency mapping. \
-                 'Raw spectrum_row' uses a fixed 91 dB scale on a log axis, so it will not line up with the \
-                 bars' height or with Mel/Bark/Linear scaling.");
+            fx_combo(ui, sh, &mut r.ghost_source, GhostSource::default(), "Source", "fx_ghost_source", 250.0,
+                &GhostSource::all(), GhostSource::display_name,
+                "Pre-ballistics bars share the bars' exact scale and frequency mapping. Raw spectrum_row uses a fixed 91 dB scale on a log axis, so it will not line up with bar heights or with Mel/Bark/Linear scaling.");
+            fx_slider(ui, sh, &mut r.ghost_thickness, 0.5..=6.0, "Thickness (px)", d.ghost_thickness,
+                "Line thickness in pixels.");
+            fx_slider_u8(ui, sh, &mut r.ghost_opacity, "Opacity", d.ghost_opacity,
+                "How opaque the line is (0–255).");
+            fx_slider(ui, sh, &mut r.ghost_gain, 0.25..=2.0, "Height gain", d.ghost_gain,
+                "Scales the line's height. Useful with the raw source, whose level differs from the bars.");
+            fx_color(ui, sh, &mut r.ghost_color, "Line color", d.ghost_color,
+                "Color of the line.");
         }
 
-        // ══ Dynamics ══════════════════════════════════════════
-        section_header(ui, "Dynamics Color (track-relative intensity)");
-        checkbox_reset(ui, &mut r.dynamics_color, "Enable", false);
+        // ── Dynamics color ───────────────────────────────────────
+        section_header(ui, "Dynamics Color");
+        fx_check(ui, sh, &mut r.dynamics_color, "Track-Relative Intensity Color",
+            "Shifts the whole palette with how hard the music is being played: calm passages go soft and muted, intense ones vivid and saturated. The app only hears audio as it plays, so it cannot see the rest of the track; it judges each moment against what you have listened to this session instead.");
         if r.dynamics_color {
             ui.horizontal(|ui| {
                 ui.label("Intensity now:");
                 ui.add(egui::ProgressBar::new(intensity.clamp(0.0, 1.0)).desired_width(220.0).show_percentage());
-                if ui.small_button("Forget this track").clicked() { reset_memory = true; }
             });
+            help_text(ui, sh, "Live reading of the analyser, 0 = calm, 100 % = intense. Use it to tune the settings below.");
+            ui.horizontal(|ui| {
+                if ui.small_button("Forget this track").clicked() { reset_kind = 1; }
+                if ui.small_button("Relearn my loudness").clicked() { reset_kind = 2; }
+            });
+            help_text(ui, sh, "Forget this track restarts the track's own memory (happens automatically when the song changes). Relearn my loudness also forgets what the session taught the app about how loud your music normally is.");
+
             sub_header(ui, "Look");
-            slider_f32(ui, &mut r.dyn_low_saturation, 0.0..=1.5, "Saturation when calm", d.dyn_low_saturation);
-            slider_f32(ui, &mut r.dyn_high_saturation, 0.5..=2.5, "Saturation when intense", d.dyn_high_saturation);
-            slider_f32(ui, &mut r.dyn_low_brightness, 0.3..=1.2, "Brightness when calm", d.dyn_low_brightness);
-            slider_f32(ui, &mut r.dyn_high_brightness, 0.7..=1.6, "Brightness when intense", d.dyn_high_brightness);
+            fx_slider(ui, sh, &mut r.dyn_low_saturation, 0.0..=1.5, "Saturation when calm", d.dyn_low_saturation,
+                "Color saturation at the quietest moments. 1 = unchanged, 0 = grey.");
+            fx_slider(ui, sh, &mut r.dyn_high_saturation, 0.5..=2.5, "Saturation when intense", d.dyn_high_saturation,
+                "Color saturation at the most intense moments. Above 1 is more vivid than your palette.");
+            fx_slider(ui, sh, &mut r.dyn_low_brightness, 0.3..=1.2, "Brightness when calm", d.dyn_low_brightness,
+                "Brightness at the quietest moments.");
+            fx_slider(ui, sh, &mut r.dyn_high_brightness, 0.7..=1.6, "Brightness when intense", d.dyn_high_brightness,
+                "Brightness at the most intense moments.");
+
             sub_header(ui, "Analysis");
-            slider_f32(ui, &mut r.dyn_contrast, 0.5..=3.0, "Contrast (raise for subtle music)", d.dyn_contrast);
-            slider_f32(ui, &mut r.dyn_memory_s, 10.0..=300.0, "Track memory (s)", d.dyn_memory_s);
-            slider_f32(ui, &mut r.dyn_attack_ms, 20.0..=1000.0, "Rise time (ms)", d.dyn_attack_ms);
-            slider_f32(ui, &mut r.dyn_release_ms, 100.0..=6000.0, "Fall time (ms)", d.dyn_release_ms);
-            slider_f32(ui, &mut r.dyn_w_loudness, 0.0..=2.0, "Weight: loudness vs. rest of track", d.dyn_w_loudness);
-            slider_f32(ui, &mut r.dyn_w_attack, 0.0..=2.0, "Weight: attack strength", d.dyn_w_attack);
-            slider_f32(ui, &mut r.dyn_w_brightness, 0.0..=2.0, "Weight: spectral brightness", d.dyn_w_brightness);
-            help_text(ui, show_help,
-                "Measures how hard the music is being played relative to this track's own history. Calm passages \
-                 shift your palette toward muted and soft; heavy passages push it to saturated and vivid. \
-                 Because it is relative, a quiet solo piano uses the full range too — raise Contrast and \
-                 the Attack weight to make it more sensitive to individual key strikes. Memory resets on track change.");
+            fx_slider(ui, sh, &mut r.dyn_typical_db, -45.0..=-8.0, "Typical loudness (dBFS)", d.dyn_typical_db,
+                "How loud your music usually is at the start. It seeds the first track, so a quiet intro reads as quiet instead of average. If the colors are always too calm or too intense, move it down or up. Changing it relearns from scratch.");
+            fx_slider(ui, sh, &mut r.dyn_absolute_blend, 0.0..=1.0, "Absolute vs. relative", d.dyn_absolute_blend,
+                "0 judges loudness only against the track so far; 1 judges it only against the typical loudness above. Higher keeps quiet passages looking quiet even after a long quiet stretch.");
+            fx_slider(ui, sh, &mut r.dyn_contrast, 0.5..=3.0, "Contrast", d.dyn_contrast,
+                "Stretches the result away from the middle. Raise it for subtle music such as solo piano.");
+            fx_slider(ui, sh, &mut r.dyn_memory_s, 10.0..=300.0, "Track memory (s)", d.dyn_memory_s,
+                "How far back the loudness comparison looks. Long = stable, short = adapts quickly to a new section.");
+            fx_slider(ui, sh, &mut r.dyn_attack_ms, 20.0..=1000.0, "Rise time (ms)", d.dyn_attack_ms,
+                "How fast the colors react when the music gets more intense.");
+            fx_slider(ui, sh, &mut r.dyn_release_ms, 100.0..=6000.0, "Fall time (ms)", d.dyn_release_ms,
+                "How slowly the colors relax when the music calms down.");
+            fx_slider(ui, sh, &mut r.dyn_w_loudness, 0.0..=2.0, "Weight: loudness", d.dyn_w_loudness,
+                "How much overall loudness counts toward intensity.");
+            fx_slider(ui, sh, &mut r.dyn_w_attack, 0.0..=2.0, "Weight: attack strength", d.dyn_w_attack,
+                "How much sudden rises in level count. Raise it to make individual key strikes or plucks show.");
+            fx_slider(ui, sh, &mut r.dyn_w_brightness, 0.0..=2.0, "Weight: brightness", d.dyn_w_brightness,
+                "How much a brighter sound counts. Harder playing is usually brighter.");
         }
 
         // Deferred actions (avoid borrowing self.config twice above)
@@ -1222,8 +1487,8 @@ impl SettingsState {
             self.config.audio.chroma_enabled = true;
             self.audio_dirty = true;
         }
-        if reset_memory {
-            self.fx_reset = true;
+        if reset_kind != 0 {
+            self.fx_reset = reset_kind;
             self.audio_dirty = true; // forces the app to pick the request up this frame
         }
     }
