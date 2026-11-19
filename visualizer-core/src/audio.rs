@@ -694,6 +694,13 @@ impl OnsetDetector {
             ),
         ];
 
+        // With a coarse FFT (wide bins) a narrow band such as the 20-150 Hz kick band can
+        // collapse to zero bins and would never fire. Guarantee at least one bin.
+        let band_bins = band_bins.map(|(lo, hi)| {
+            let lo = lo.min(n_bins.saturating_sub(1));
+            (lo, hi.max((lo + 1).min(n_bins)))
+        });
+
         let mut total_flux = 0.0f32;
         let mut band_flux = [0.0f32; 3];
         for k in 1..n_bins {
@@ -973,6 +980,8 @@ struct AudioProcessor {
     agc_envelope: f32,
 
     onset_detector: OnsetDetector,
+    /// Scratch buffer for the onset detector (avoids one allocation per frame).
+    onset_mags: Vec<f32>,
     beat_times: VecDeque<f64>,
     bpm_raw: f32,
     tap_bpm: f32,
@@ -1056,6 +1065,7 @@ impl AudioProcessor {
             cached_avg: 1,
             agc_envelope: 1.0,
             onset_detector: OnsetDetector::new(nyquist),
+            onset_mags: Vec::new(),
             beat_times: VecDeque::with_capacity(MAX_BEATS),
             bpm_raw: 0.0,
             tap_bpm: 0.0,
@@ -1338,8 +1348,12 @@ impl AudioProcessor {
         self.last_rms = raw_rms;
         self.last_peak = raw_peak;
 
-        let n_new = window_slice.len().min(WAVEFORM_LEN);
-        let to_copy = &window_slice[window_slice.len() - n_new..];
+        // Take the scope from the full history (>= 1024 samples), not from the FFT
+        // window: with a 512-point FFT the window is shorter than the scope and the
+        // ring would otherwise be filled with repeated samples.
+        let wf_src: &[f32] = if history.len() >= WAVEFORM_LEN { history } else { window_slice };
+        let n_new = wf_src.len().min(WAVEFORM_LEN);
+        let to_copy = &wf_src[wf_src.len() - n_new..];
         if n_new >= WAVEFORM_LEN {
             self.waveform_buf.copy_from_slice(to_copy);
             self.waveform_pos = 0;
@@ -1660,7 +1674,9 @@ impl AudioProcessor {
         bin_width: f32,
         nyquist: usize,
     ) -> (bool, bool, f32, f32) {
-        let mut mags = vec![0.0f32; nyquist];
+        let mut mags = std::mem::take(&mut self.onset_mags);
+        mags.clear();
+        mags.resize(nyquist, 0.0);
         for k in 1..nyquist { mags[k] = self.output_buffer[k].norm(); }
 
         let (onsets, beat_fire) = self.onset_detector.detect(
@@ -1671,6 +1687,7 @@ impl AudioProcessor {
             self.time_elapsed,
             s.beat_focus,
         );
+        self.onset_mags = mags;
 
         // Tempo from the periodicity of the onset strength. Runs regardless of
         // tap / manual overrides so a good estimate is ready when they end.
