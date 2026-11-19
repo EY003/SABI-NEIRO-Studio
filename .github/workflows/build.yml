@@ -37,16 +37,16 @@ jobs:
     - name: Upload Executable Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Rust-Visualizer-Windows
+        name: SABI NEIRO
         # Uploads the final .exe from the target/release folder
-        path: target/release/visualizer-app.exe
+        path: target/release/SABI NEIRO.exe
         if-no-files-found: error
 
     - name: Create GitHub Release (Only on Tags)
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
-        files: target/release/visualizer-app.exe
+        files: target/release/SABI NEIRO.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
