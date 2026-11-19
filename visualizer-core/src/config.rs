@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Product name and version shown in the UI / tray.
+pub const APP_NAME: &str = "SABI NEIRO";
+pub const APP_VERSION: &str = "17.0";
+
 // ─────────────────────────────────────────────────────────────
 // Default value constants (single source of truth)
 // ─────────────────────────────────────────────────────────────
@@ -58,6 +62,8 @@ pub const DEFAULT_PER_BAND_BALLISTICS:     bool  = false;
 pub const DEFAULT_PER_FRAME_NORMALIZATION: bool  = false;
 pub const DEFAULT_BEAT_ENVELOPE_DECAY_MS:  f32   = 120.0;
 pub const DEFAULT_PEAK_BLOOM:              bool  = false;
+/// Render frame-rate cap in fps (0 = follow the monitor refresh rate).
+pub const DEFAULT_FPS_CAP:                 u32   = 60;
 
 // ─────────────────────────────────────────────────────────────
 // Visualizer primitives
@@ -207,12 +213,18 @@ fn default_palette_size() -> u8 { 1 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionShape {
-    Uniform, HorizontalWipe, VerticalWipe, DiagonalWipe,
-    RadialWipe, Spiral, WaveInterference, Ripple,
-    SineWave, TriangleWave, SquareWave, SawtoothWave,
-    Strobe, Pulse, Heartbeat, Stutter, Comet, Chase, BouncingBall, Sparkle,
-    FireSimulation, Plasma, RainbowCycle, Confetti, Sinelon,
-    Breathing, FlipFlop, Kaleidoscope, DigitalRain, MeteorShower,
+    Uniform, HorizontalWipe, VerticalWipe, DiagonalWipe, RadialWipe, Spiral,
+    WaveInterference, Ripple, SineWave, TriangleWave, SquareWave, SawtoothWave,
+    Strobe, Pulse, Heartbeat, Stutter, Comet, Chase,
+    BouncingBall, Sparkle, FireSimulation, Plasma, RainbowCycle, Confetti,
+    Sinelon, Breathing, FlipFlop, Kaleidoscope, DigitalRain, MeteorShower,
+    // ── added in v17 ──
+    AuroraCurtain, LavaLamp, CylonScanner, Lightning, OceanTide,
+    RainDrops, Snowfall, FireflyGlow, DiscoBall, Searchlight,
+    BarberPole, Checkerboard, BokehLights, DoubleHelix, Pendulum,
+    TwinComets, EqualizerBounce, Stairs, TheaterChase, Glitch,
+    DiscoFloor, Vortex, Supernova, NeonSign, StrobeBurst,
+    MirrorPulse, DominoFall, CandleFlicker, RadarSweep, Waterfall,
 }
 impl Default for MotionShape { fn default() -> Self { MotionShape::Uniform } }
 impl MotionShape {
@@ -248,40 +260,180 @@ impl MotionShape {
             MotionShape::Kaleidoscope => "Kaleidoscope",
             MotionShape::DigitalRain => "Digital Rain",
             MotionShape::MeteorShower => "Meteor Shower",
+            MotionShape::AuroraCurtain => "Aurora Curtain",
+            MotionShape::LavaLamp => "Lava Lamp",
+            MotionShape::CylonScanner => "Cylon Scanner",
+            MotionShape::Lightning => "Lightning",
+            MotionShape::OceanTide => "Ocean Tide",
+            MotionShape::RainDrops => "Rain Drops",
+            MotionShape::Snowfall => "Snowfall",
+            MotionShape::FireflyGlow => "Firefly Glow",
+            MotionShape::DiscoBall => "Disco Ball",
+            MotionShape::Searchlight => "Searchlight",
+            MotionShape::BarberPole => "Barber Pole",
+            MotionShape::Checkerboard => "Checkerboard",
+            MotionShape::BokehLights => "Bokeh Lights",
+            MotionShape::DoubleHelix => "Double Helix",
+            MotionShape::Pendulum => "Pendulum",
+            MotionShape::TwinComets => "Twin Comets",
+            MotionShape::EqualizerBounce => "Equalizer Bounce",
+            MotionShape::Stairs => "Stairs",
+            MotionShape::TheaterChase => "Theater Chase",
+            MotionShape::Glitch => "Glitch",
+            MotionShape::DiscoFloor => "Disco Floor",
+            MotionShape::Vortex => "Vortex",
+            MotionShape::Supernova => "Supernova",
+            MotionShape::NeonSign => "Neon Sign",
+            MotionShape::StrobeBurst => "Strobe Burst",
+            MotionShape::MirrorPulse => "Mirror Pulse",
+            MotionShape::DominoFall => "Domino Fall",
+            MotionShape::CandleFlicker => "Candle Flicker",
+            MotionShape::RadarSweep => "Radar Sweep",
+            MotionShape::Waterfall => "Waterfall",
         }
     }
+
+    /// One-line help text shown under the shape selector.
+    pub fn description(self) -> &'static str {
+        match self {
+            MotionShape::Uniform => "Every bar shows the same colour at the same time, and the whole visualizer fades through your palette together.",
+            MotionShape::HorizontalWipe => "A soft edge sweeps left and right across the bars, wiping one colour over the next.",
+            MotionShape::VerticalWipe => "A colour edge rises and falls along the height of the bars.",
+            MotionShape::DiagonalWipe => "A colour edge sweeps diagonally across the visualizer.",
+            MotionShape::RadialWipe => "A colour front expands from the centre outwards and collapses back in.",
+            MotionShape::Spiral => "Colours twist around the centre like a slowly turning spiral.",
+            MotionShape::WaveInterference => "Two crossing waves form a shifting, woven colour pattern. Wave Frequency sets how many ripples fit across.",
+            MotionShape::Ripple => "Concentric rings spread out from the centre like drops on a pond.",
+            MotionShape::SineWave => "A smooth wave of colour travels across the bars. Wave Frequency sets how many waves are visible.",
+            MotionShape::TriangleWave => "Like Sine Wave but with straight, zig-zag slopes instead of curves.",
+            MotionShape::SquareWave => "Alternating bands that jump abruptly between two positions in your palette.",
+            MotionShape::SawtoothWave => "Colour ramps up gradually, then snaps back and repeats across the bars.",
+            MotionShape::Strobe => "The whole visualizer flashes on and off in rapid pulses. Use Hard blend for sharp flashes.",
+            MotionShape::Pulse => "A smooth, steady swell of brightness in and out.",
+            MotionShape::Heartbeat => "A 'lub-dub' double thump followed by a rest. The first thump uses one palette colour and the second thump the next, and every heartbeat moves further along your palette, so all of your colours show up.",
+            MotionShape::Stutter => "Random bars glitch to another colour for a split second. Event Intensity sets how often.",
+            MotionShape::Comet => "A bright head races across the bars leaving a fading tail, and wraps around at the edge. Trail Length sets the tail.",
+            MotionShape::Chase => "A short bright band chases across the bars and loops around.",
+            MotionShape::BouncingBall => "A bright spot bounces back and forth between the left and right edges. Trail Length sets its glow.",
+            MotionShape::Sparkle => "Single bars twinkle on and off like glitter. Event Intensity sets how many.",
+            MotionShape::FireSimulation => "Flickering, uneven brightness that rolls across the bars like flames.",
+            MotionShape::Plasma => "Overlapping waves blend into a slow, liquid colour field.",
+            MotionShape::RainbowCycle => "Your whole palette is spread across the bars and scrolls sideways endlessly.",
+            MotionShape::Confetti => "Random bars pop up in random palette colours and vanish. Event Intensity sets how many.",
+            MotionShape::Sinelon => "A smooth glowing dot sweeps back and forth with a soft trail. Trail Length sets the glow size.",
+            MotionShape::Breathing => "A slow, calm fade in and out, like breathing.",
+            MotionShape::FlipFlop => "The visualizer alternates between lit and dark.",
+            MotionShape::Kaleidoscope => "Symmetric, shifting patterns that fold colours into each other. Wave Frequency sets how fine the pattern is.",
+            MotionShape::DigitalRain => "Streaks of colour fall down the bars in columns at different speeds, Matrix style.",
+            MotionShape::MeteorShower => "Bright streaks shoot across the bars with fading tails.",
+            MotionShape::AuroraCurtain => "Slow, drifting curtains of colour that glow near the base of the bars and fade toward the tips, like the northern lights. Wave Frequency sets how many curtains you see.",
+            MotionShape::LavaLamp => "Soft blobs of colour slowly drift, merge and split, like wax in a lava lamp.",
+            MotionShape::CylonScanner => "A bright eye sweeps back and forth with a long tail that always trails behind it, like a retro scanner light. Trail Length sets the tail.",
+            MotionShape::Lightning => "Sudden flashes light up part of the visualizer and fade away, each in a random palette colour. Event Intensity sets how often it strikes and Trail Length how wide each flash spreads.",
+            MotionShape::OceanTide => "A water level slowly rises and falls along the bars with ripples on the surface and foam in the next palette colour.",
+            MotionShape::RainDrops => "Short streaks fall down random bars like rain on a window. Event Intensity sets how many bars have a drop and Trail Length how long the streaks are.",
+            MotionShape::Snowfall => "Sparse, soft flakes drift slowly down the bars. Event Intensity sets how many flakes there are.",
+            MotionShape::FireflyGlow => "Every bar fades softly in and out at its own pace, like fireflies on a summer night.",
+            MotionShape::DiscoBall => "Beams of light spin around the centre like the reflections from a mirror ball.",
+            MotionShape::Searchlight => "A beam of light sweeps from side to side, pivoting from the bottom of the bars. Trail Length sets the beam width.",
+            MotionShape::BarberPole => "Diagonal stripes in two palette colours slide across the visualizer. Wave Frequency sets how many stripes there are.",
+            MotionShape::Checkerboard => "A chequered pattern of two palette colours that swaps places every cycle. Wave Frequency sets the size of the squares.",
+            MotionShape::BokehLights => "Large, out-of-focus balls of light float around, each in its own palette colour.",
+            MotionShape::DoubleHelix => "Two glowing strands twist around each other along the bars, like a strand of DNA. Wave Frequency sets how many twists you see.",
+            MotionShape::Pendulum => "A glowing ball swings from side to side, slowing down at each end like a real pendulum. Trail Length sets the glow size.",
+            MotionShape::TwinComets => "Two comets start from opposite edges, cross in the middle and bounce back, each with its own colour. Trail Length sets their tails.",
+            MotionShape::EqualizerBounce => "Every column bounces up and down by itself like a tiny level meter, with your palette stretched from bottom to top. Use Hard blend for separate LED blocks.",
+            MotionShape::Stairs => "Your palette is split into hard steps of colour that scroll sideways. Wave Frequency sets how many steps there are.",
+            MotionShape::TheaterChase => "Every third bar lights up and the pattern marches along, like a cinema marquee.",
+            MotionShape::Glitch => "Blocks of bars randomly jump to another colour or drop out for a moment, like a broken video signal. Event Intensity sets how much glitches.",
+            MotionShape::DiscoFloor => "A grid of squares that each jump to a new random palette colour a couple of times a second. Wave Frequency sets the size of the grid.",
+            MotionShape::Vortex => "Bright arms spiral around the centre and pull colours inward like a whirlpool. Wave Frequency sets how many arms there are.",
+            MotionShape::Supernova => "A ring of light bursts out from the centre, fades as it expands, and then a new one starts in the next colour. Trail Length sets the ring width.",
+            MotionShape::NeonSign => "A steady glow with the odd faulty section that flickers on and off, like an old neon sign. Event Intensity sets how unstable it is.",
+            MotionShape::StrobeBurst => "Short bursts of fast flashes separated by calm, dark gaps.",
+            MotionShape::MirrorPulse => "Waves of light travel outward from the middle to both edges at once. Trail Length sets the width of each wave.",
+            MotionShape::DominoFall => "Colour 'tips over' bar by bar from left to right like falling dominoes, and every pass brings a new palette colour. Wipe Softness sets how sharp the falling edge is.",
+            MotionShape::CandleFlicker => "A warm, living flicker like candlelight. Event Intensity sets how strongly the flame wavers.",
+            MotionShape::RadarSweep => "A line rotates around the centre like a radar screen and leaves a fading afterglow. Trail Length sets how long the afterglow lasts.",
+            MotionShape::Waterfall => "Streaks of colour pour down the bars toward their base, each column flowing at its own speed. Wave Frequency sets how many streaks fit along the bars.",
+        }
+    }
+    /// Shapes whose colour also varies along the bar height (drawn as stacked segments).
     pub fn uses_vertical_axis(self) -> bool {
         matches!(self,
-            MotionShape::VerticalWipe | MotionShape::DiagonalWipe
-            | MotionShape::RadialWipe | MotionShape::Spiral
-            | MotionShape::WaveInterference | MotionShape::Ripple
-            | MotionShape::Plasma | MotionShape::Kaleidoscope
-            | MotionShape::DigitalRain | MotionShape::MeteorShower
+            MotionShape::VerticalWipe | MotionShape::DiagonalWipe | MotionShape::RadialWipe | MotionShape::Spiral
+            | MotionShape::WaveInterference | MotionShape::Ripple | MotionShape::Plasma | MotionShape::Kaleidoscope
+            | MotionShape::DigitalRain | MotionShape::MeteorShower | MotionShape::AuroraCurtain | MotionShape::LavaLamp
+            | MotionShape::OceanTide | MotionShape::RainDrops | MotionShape::Snowfall | MotionShape::DiscoBall
+            | MotionShape::Searchlight | MotionShape::BarberPole | MotionShape::Checkerboard | MotionShape::BokehLights
+            | MotionShape::DoubleHelix | MotionShape::EqualizerBounce | MotionShape::DiscoFloor | MotionShape::Vortex
+            | MotionShape::Supernova | MotionShape::RadarSweep | MotionShape::Waterfall
         )
     }
+    /// Shapes that fade between the palette colour and the Off Color.
     pub fn uses_intensity(self) -> bool {
-        matches!(
-            self,
-            MotionShape::Strobe | MotionShape::Pulse | MotionShape::Heartbeat
-            | MotionShape::Comet | MotionShape::Chase | MotionShape::BouncingBall
-            | MotionShape::Sparkle | MotionShape::Sinelon
-            | MotionShape::FireSimulation | MotionShape::Confetti
-            | MotionShape::Breathing | MotionShape::FlipFlop | MotionShape::DigitalRain | MotionShape::MeteorShower
+        matches!(self,
+            MotionShape::Strobe | MotionShape::Pulse | MotionShape::Heartbeat | MotionShape::Comet
+            | MotionShape::Chase | MotionShape::BouncingBall | MotionShape::Sparkle | MotionShape::FireSimulation
+            | MotionShape::Confetti | MotionShape::Sinelon | MotionShape::Breathing | MotionShape::FlipFlop
+            | MotionShape::DigitalRain | MotionShape::MeteorShower | MotionShape::AuroraCurtain | MotionShape::LavaLamp
+            | MotionShape::CylonScanner | MotionShape::Lightning | MotionShape::OceanTide | MotionShape::RainDrops
+            | MotionShape::Snowfall | MotionShape::FireflyGlow | MotionShape::DiscoBall | MotionShape::Searchlight
+            | MotionShape::BokehLights | MotionShape::DoubleHelix | MotionShape::Pendulum | MotionShape::TwinComets
+            | MotionShape::EqualizerBounce | MotionShape::TheaterChase | MotionShape::Glitch | MotionShape::Vortex
+            | MotionShape::Supernova | MotionShape::NeonSign | MotionShape::StrobeBurst | MotionShape::MirrorPulse
+            | MotionShape::CandleFlicker | MotionShape::RadarSweep | MotionShape::Waterfall
         )
     }
-    pub fn all() -> [MotionShape; 30] {
+    /// Shapes controlled by the Wave Frequency slider.
+    pub fn uses_wave_frequency(self) -> bool {
+        matches!(self,
+            MotionShape::WaveInterference | MotionShape::SineWave | MotionShape::TriangleWave | MotionShape::SquareWave
+            | MotionShape::SawtoothWave | MotionShape::Kaleidoscope | MotionShape::AuroraCurtain | MotionShape::BarberPole
+            | MotionShape::Checkerboard | MotionShape::DoubleHelix | MotionShape::Stairs | MotionShape::DiscoFloor
+            | MotionShape::Vortex | MotionShape::Waterfall
+        )
+    }
+    /// Shapes controlled by the Trail Length slider.
+    pub fn uses_trail_length(self) -> bool {
+        matches!(self,
+            MotionShape::Comet | MotionShape::BouncingBall | MotionShape::Sinelon | MotionShape::CylonScanner
+            | MotionShape::Lightning | MotionShape::RainDrops | MotionShape::Searchlight | MotionShape::Pendulum
+            | MotionShape::TwinComets | MotionShape::Supernova | MotionShape::MirrorPulse | MotionShape::RadarSweep
+        )
+    }
+    /// Shapes controlled by the Event Intensity slider.
+    pub fn uses_event_intensity(self) -> bool {
+        matches!(self,
+            MotionShape::Stutter | MotionShape::Sparkle | MotionShape::Confetti | MotionShape::Lightning
+            | MotionShape::RainDrops | MotionShape::Snowfall | MotionShape::Glitch | MotionShape::NeonSign
+            | MotionShape::CandleFlicker
+        )
+    }
+    /// Shapes controlled by the Wipe Softness slider (Smooth blend only).
+    pub fn uses_wipe_softness(self) -> bool {
+        matches!(self,
+            MotionShape::HorizontalWipe | MotionShape::VerticalWipe | MotionShape::DiagonalWipe | MotionShape::RadialWipe
+            | MotionShape::DominoFall
+        )
+    }
+    pub fn all() -> [MotionShape; 60] {
         [
-            MotionShape::Uniform, MotionShape::HorizontalWipe, MotionShape::VerticalWipe,
-            MotionShape::DiagonalWipe, MotionShape::RadialWipe, MotionShape::Spiral,
-            MotionShape::WaveInterference, MotionShape::Ripple,
-            MotionShape::SineWave, MotionShape::TriangleWave, MotionShape::SquareWave,
-            MotionShape::SawtoothWave, MotionShape::Strobe, MotionShape::Pulse,
-            MotionShape::Heartbeat, MotionShape::Stutter, MotionShape::Comet,
-            MotionShape::Chase, MotionShape::BouncingBall, MotionShape::Sparkle,
-            MotionShape::FireSimulation, MotionShape::Plasma, MotionShape::RainbowCycle,
-            MotionShape::Confetti, MotionShape::Sinelon, MotionShape::Breathing,
-            MotionShape::FlipFlop, MotionShape::Kaleidoscope, MotionShape::DigitalRain,
-            MotionShape::MeteorShower,
+            MotionShape::Uniform, MotionShape::HorizontalWipe, MotionShape::VerticalWipe, MotionShape::DiagonalWipe,
+            MotionShape::RadialWipe, MotionShape::Spiral, MotionShape::WaveInterference, MotionShape::Ripple,
+            MotionShape::SineWave, MotionShape::TriangleWave, MotionShape::SquareWave, MotionShape::SawtoothWave,
+            MotionShape::Strobe, MotionShape::Pulse, MotionShape::Heartbeat, MotionShape::Stutter,
+            MotionShape::Comet, MotionShape::Chase, MotionShape::BouncingBall, MotionShape::Sparkle,
+            MotionShape::FireSimulation, MotionShape::Plasma, MotionShape::RainbowCycle, MotionShape::Confetti,
+            MotionShape::Sinelon, MotionShape::Breathing, MotionShape::FlipFlop, MotionShape::Kaleidoscope,
+            MotionShape::DigitalRain, MotionShape::MeteorShower, MotionShape::AuroraCurtain, MotionShape::LavaLamp,
+            MotionShape::CylonScanner, MotionShape::Lightning, MotionShape::OceanTide, MotionShape::RainDrops,
+            MotionShape::Snowfall, MotionShape::FireflyGlow, MotionShape::DiscoBall, MotionShape::Searchlight,
+            MotionShape::BarberPole, MotionShape::Checkerboard, MotionShape::BokehLights, MotionShape::DoubleHelix,
+            MotionShape::Pendulum, MotionShape::TwinComets, MotionShape::EqualizerBounce, MotionShape::Stairs,
+            MotionShape::TheaterChase, MotionShape::Glitch, MotionShape::DiscoFloor, MotionShape::Vortex,
+            MotionShape::Supernova, MotionShape::NeonSign, MotionShape::StrobeBurst, MotionShape::MirrorPulse,
+            MotionShape::DominoFall, MotionShape::CandleFlicker, MotionShape::RadarSweep, MotionShape::Waterfall,
         ]
     }
 }
@@ -735,8 +887,13 @@ impl Default for AudioSettings {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AudioPreset {
-    Universal, Pop, Rock, Electronic, HipHop, Classical, Piano, Jazz, Ambient,
-    LoFi, Metal, Country, RnB, Vocal, Podcast,
+    Universal, Pop, Rock, Metal, Indie, Country,
+    Folk, Acoustic, Blues, Jazz, Funk, RnB,
+    Reggae, Latin, HipHop, Trap, Electronic, Dance,
+    Club, House, Deep, Techno, Trance, DrumAndBass,
+    Dubstep, Synthwave, BassBoost, HighEnergy, Classical, Cinematic,
+    Piano, Ambient, Chill, LoFi, NightMode, Vocal,
+    Podcast, Live, Gaming,
 }
 
 fn window_db_shift(w: WindowFunction) -> f32 {
@@ -750,13 +907,18 @@ fn window_db_shift(w: WindowFunction) -> f32 {
 }
 
 impl AudioPreset {
-    pub fn all() -> [AudioPreset; 15] {
+    pub fn all() -> [AudioPreset; 39] {
         [
-            AudioPreset::Universal, AudioPreset::Pop, AudioPreset::Rock,
-            AudioPreset::Electronic, AudioPreset::HipHop, AudioPreset::Classical,
-            AudioPreset::Piano, AudioPreset::Jazz, AudioPreset::Ambient,
-            AudioPreset::LoFi, AudioPreset::Metal, AudioPreset::Country,
-            AudioPreset::RnB, AudioPreset::Vocal, AudioPreset::Podcast,
+            AudioPreset::Universal, AudioPreset::Pop, AudioPreset::Rock, AudioPreset::Metal,
+            AudioPreset::Indie, AudioPreset::Country, AudioPreset::Folk, AudioPreset::Acoustic,
+            AudioPreset::Blues, AudioPreset::Jazz, AudioPreset::Funk, AudioPreset::RnB,
+            AudioPreset::Reggae, AudioPreset::Latin, AudioPreset::HipHop, AudioPreset::Trap,
+            AudioPreset::Electronic, AudioPreset::Dance, AudioPreset::Club, AudioPreset::House,
+            AudioPreset::Deep, AudioPreset::Techno, AudioPreset::Trance, AudioPreset::DrumAndBass,
+            AudioPreset::Dubstep, AudioPreset::Synthwave, AudioPreset::BassBoost, AudioPreset::HighEnergy,
+            AudioPreset::Classical, AudioPreset::Cinematic, AudioPreset::Piano, AudioPreset::Ambient,
+            AudioPreset::Chill, AudioPreset::LoFi, AudioPreset::NightMode, AudioPreset::Vocal,
+            AudioPreset::Podcast, AudioPreset::Live, AudioPreset::Gaming,
         ]
     }
     pub fn display_name(self) -> &'static str {
@@ -764,37 +926,85 @@ impl AudioPreset {
             AudioPreset::Universal => "Universal",
             AudioPreset::Pop => "Pop",
             AudioPreset::Rock => "Rock",
-            AudioPreset::Electronic => "Electronic / EDM",
-            AudioPreset::HipHop => "Hip-hop",
-            AudioPreset::Classical => "Classical",
-            AudioPreset::Piano => "Piano",
-            AudioPreset::Jazz => "Jazz",
-            AudioPreset::Ambient => "Ambient",
-            AudioPreset::LoFi => "Lo-Fi",
             AudioPreset::Metal => "Metal",
+            AudioPreset::Indie => "Indie / Alternative",
             AudioPreset::Country => "Country",
+            AudioPreset::Folk => "Folk",
+            AudioPreset::Acoustic => "Acoustic",
+            AudioPreset::Blues => "Blues",
+            AudioPreset::Jazz => "Jazz",
+            AudioPreset::Funk => "Funk",
             AudioPreset::RnB => "R&B / Soul",
+            AudioPreset::Reggae => "Reggae",
+            AudioPreset::Latin => "Latin",
+            AudioPreset::HipHop => "Hip-hop",
+            AudioPreset::Trap => "Trap",
+            AudioPreset::Electronic => "Electronic / EDM",
+            AudioPreset::Dance => "Dance",
+            AudioPreset::Club => "Club",
+            AudioPreset::House => "House",
+            AudioPreset::Deep => "Deep",
+            AudioPreset::Techno => "Techno",
+            AudioPreset::Trance => "Trance",
+            AudioPreset::DrumAndBass => "Drum & Bass",
+            AudioPreset::Dubstep => "Dubstep",
+            AudioPreset::Synthwave => "Synthwave",
+            AudioPreset::BassBoost => "Bass Boost",
+            AudioPreset::HighEnergy => "High Energy",
+            AudioPreset::Classical => "Classical",
+            AudioPreset::Cinematic => "Cinematic / Orchestral",
+            AudioPreset::Piano => "Piano",
+            AudioPreset::Ambient => "Ambient",
+            AudioPreset::Chill => "Chill / Lounge",
+            AudioPreset::LoFi => "Lo-Fi",
+            AudioPreset::NightMode => "Night Mode",
             AudioPreset::Vocal => "Vocal / Acapella",
             AudioPreset::Podcast => "Podcast / Voice",
+            AudioPreset::Live => "Live / Concert",
+            AudioPreset::Gaming => "Gaming / Movies",
         }
     }
     pub fn description(self) -> &'static str {
         match self {
             AudioPreset::Universal => "Balanced defaults that work well across most music.",
-            AudioPreset::Pop => "Punchy and bright, emphasises vocals and kicks for modern radio pop.",
-            AudioPreset::Rock => "Mid-forward with dynamic transients, good for guitars and drums.",
-            AudioPreset::Electronic => "Kick-focused with tight decay and BPM lock, tuned for EDM and house.",
-            AudioPreset::HipHop => "Bass-heavy and punchy, emphasises 808s and kick drums.",
-            AudioPreset::Classical => "Preserves dynamic range (AGC off), softer attack, long decay, clean tones.",
-            AudioPreset::Piano => "Clean tone with sustain, good for solo piano and acoustic material.",
-            AudioPreset::Jazz => "Warm and smooth, gentler response curve and longer decay.",
-            AudioPreset::Ambient => "Slow and flowing, heavy smoothing, soft attack. AGC off so the track's own dynamics come through.",
-            AudioPreset::LoFi => "Soft, warm, and slow. Long smoothing window and rolled-off highs for a mellow look.",
-            AudioPreset::Metal => "Aggressive and punchy. Fast attack, wide dynamic range, mid-forward.",
+            AudioPreset::Pop => "Punchy and bright: lifts the kick and the vocal sparkle of modern radio pop.",
+            AudioPreset::Rock => "Mid-forward with lively transients, good for guitars and drums.",
+            AudioPreset::Metal => "Aggressive and punchy. Very fast attack, wide dynamic range, mid-forward.",
+            AudioPreset::Indie => "Natural and slightly airy: guitars, vocals and drums at an even level with moderate smoothing.",
             AudioPreset::Country => "Clean and dynamic. Balanced mids with moderate smoothing.",
+            AudioPreset::Folk => "Gentle and woody: resolves strummed strings and voice with a soft, even response.",
+            AudioPreset::Acoustic => "Natural and detailed: long FFT to separate guitar strings and voices, gentle decay, no beat gimmicks.",
+            AudioPreset::Blues => "Warm and unhurried: mid-heavy with rolled-off treble and a long, soft decay.",
+            AudioPreset::Jazz => "Warm and smooth, gentler response curve and longer decay.",
+            AudioPreset::Funk => "Tight and groovy: fast attack, strong bass-guitar and kick, tempo-locked for steady pocket grooves.",
             AudioPreset::RnB => "Smooth bass emphasis with vocal presence. Sweet spot between Pop and Hip-hop.",
+            AudioPreset::Reggae => "Bass-led and relaxed: heavy low end, medium decay, no tempo lock so the off-beat skank is not forced onto a grid.",
+            AudioPreset::Latin => "Percussion-forward: quick response for congas, claves and brass, with a bright top end.",
+            AudioPreset::HipHop => "Bass-heavy and punchy, emphasises 808s and kick drums.",
+            AudioPreset::Trap => "Sub-bass heavy: long FFT to separate 808 pitches, hard attack and snappy gravity fall for rolling hats.",
+            AudioPreset::Electronic => "Kick-focused with tight decay and BPM lock, tuned for EDM and house.",
+            AudioPreset::Dance => "Bright and bouncy pop-dance: punchy kick, shiny highs and a tempo-locked pulse.",
+            AudioPreset::Club => "Four-on-the-floor club sound: hard-hitting kicks, snappy gravity fall and a locked beat clock.",
+            AudioPreset::House => "Steady and groovy: strong kick, open hats and a tempo-locked pulse around 120-130 BPM.",
+            AudioPreset::Deep => "Deep, slow bass: extended sub-bass with a long FFT, softened treble and a heavy, rolling low end.",
+            AudioPreset::Techno => "Relentless and hard: very short decay, strong contrast and a tight tempo lock for 125-150 BPM.",
+            AudioPreset::Trance => "Euphoric and flowing: moderate decay with a little smoothing so long synth lines look like waves.",
+            AudioPreset::DrumAndBass => "Fast and sharp for 160-180 BPM: no attack, very quick fall and a high beat sensitivity for busy breakbeats.",
+            AudioPreset::Dubstep => "Huge sub-bass and wobbles: long FFT for the low end, strong bass boost and a fast fall for the drops.",
+            AudioPreset::Synthwave => "Retro synth look: wide, smooth pads and a punchy gated kick on a steady tempo.",
+            AudioPreset::BassBoost => "Everything about the low end: strong bass lift, tilted down to cut the highs and a fast bass-driven response.",
+            AudioPreset::HighEnergy => "Workout and party mode: maximum contrast, instant attack and snappy movement on every beat.",
+            AudioPreset::Classical => "Preserves dynamic range (AGC off), softer attack, long decay, clean tones.",
+            AudioPreset::Cinematic => "Film-score dynamics: AGC off so whispers and crescendos both read, long FFT and a slow, broad decay.",
+            AudioPreset::Piano => "Clean tone with sustain, tuned for solo piano: peak bloom and a tight range around the keyboard.",
+            AudioPreset::Ambient => "Slow and flowing, heavy smoothing, soft attack. AGC off so the track's own dynamics come through.",
+            AudioPreset::Chill => "Laid-back and soft: slow attack, long decay and averaged bars with a mellow, slightly warm balance.",
+            AudioPreset::LoFi => "Soft, warm, and slow. Long smoothing window and rolled-off highs for a mellow look.",
+            AudioPreset::NightMode => "For quiet late-night listening: high sensitivity and a low range so soft music still moves, with the bass trimmed.",
             AudioPreset::Vocal => "Mid-focused and voice-oriented. Narrow band and longer decay for legato passages.",
             AudioPreset::Podcast => "Narrow speech band with heavy smoothing, clean and steady.",
+            AudioPreset::Live => "For live recordings: a small noise gate to ignore crowd hiss, mid-forward and a forgiving beat detector.",
+            AudioPreset::Gaming => "Reacts quickly to effects, explosions and dialogue: fast attack, bright top end and no musical chroma analysis.",
         }
     }
     pub fn settings(self) -> AudioSettings {
@@ -809,9 +1019,10 @@ impl AudioPreset {
                 target_dynamic_range_db: 55.0, decay_time_ms: 200.0,
                 decay_mode: DecayMode::Exponential, average_size: 2,
                 beat_detection_sensitivity: 0.6, onset_threshold_multiplier: 1.4,
-                eq_treble_db: 1.5,
+                eq_bass_db: 1.0, eq_treble_db: 1.5,
                 ..d
             },
+
             AudioPreset::Rock => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
                 min_decibels: -90.0, max_decibels: -25.0,
@@ -820,8 +1031,161 @@ impl AudioPreset {
                 decay_time_ms: 250.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.55,
                 onset_threshold_multiplier: 1.4,
-                eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid, ..d
+                eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid,
+                ..d
             },
+
+            AudioPreset::Metal => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 55.0,
+                sensitivity: 60.0, response_gamma: 1.5, spectrum_tilt: 1.0,
+                attack_time_ms: 1.0, decay_time_ms: 180.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                onset_threshold_multiplier: 1.6, eq_mid_db: 2.5, eq_treble_db: 1.0,
+                beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Indie => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                sensitivity: 55.0, response_gamma: 1.5, spectrum_tilt: 2.5,
+                target_dynamic_range_db: 60.0, attack_time_ms: 5.0,
+                decay_time_ms: 280.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
+                eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Country => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.0,
+                attack_time_ms: 6.0, decay_time_ms: 300.0,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
+                eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Folk => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 60.0, max_frequency_hz: 12_000.0,
+                min_decibels: -96.0, max_decibels: -28.0, target_dynamic_range_db: 62.0,
+                sensitivity: 58.0, response_gamma: 1.35, spectrum_tilt: 3.5,
+                attack_time_ms: 8.0, decay_time_ms: 350.0,
+                decay_mode: DecayMode::Exponential, average_size: 2,
+                beat_detection_sensitivity: 0.35, onset_threshold_multiplier: 1.7,
+                eq_mid_db: 1.5, peak_bloom: true, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Acoustic => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 40.0, max_frequency_hz: 14_000.0,
+                min_decibels: -96.0, max_decibels: -28.0, target_dynamic_range_db: 62.0,
+                sensitivity: 58.0, response_gamma: 1.35, spectrum_tilt: 3.5,
+                attack_time_ms: 8.0, decay_time_ms: 380.0,
+                decay_mode: DecayMode::Exponential, average_size: 2,
+                frequency_smoothing: 0.10,
+                beat_detection_sensitivity: 0.35, onset_threshold_multiplier: 1.7,
+                eq_mid_db: 1.0, eq_treble_db: 0.5, peak_bloom: true,
+                beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Blues => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                min_frequency_hz: 40.0, max_frequency_hz: 10_000.0,
+                min_decibels: -90.0, max_decibels: -27.0, target_dynamic_range_db: 60.0,
+                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
+                attack_time_ms: 10.0, decay_time_ms: 420.0, decay_mode: DecayMode::Exponential,
+                average_size: 3, beat_detection_sensitivity: 0.4,
+                onset_threshold_multiplier: 1.7,
+                eq_bass_db: 1.0, eq_mid_db: 1.5, eq_treble_db: -1.5,
+                beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Jazz => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                min_decibels: -90.0, max_decibels: -27.0, target_dynamic_range_db: 60.0,
+                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
+                attack_time_ms: 10.0, decay_time_ms: 400.0, decay_mode: DecayMode::Exponential,
+                average_size: 3, beat_detection_sensitivity: 0.45,
+                onset_threshold_multiplier: 1.6,
+                ..d
+            },
+
+            AudioPreset::Funk => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 60.0, response_gamma: 1.7, spectrum_tilt: 2.0,
+                target_dynamic_range_db: 55.0, attack_time_ms: 1.0,
+                decay_time_ms: 190.0, decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.65,
+                onset_threshold_multiplier: 1.4, bpm_lock_enabled: true,
+                eq_bass_db: 2.0, eq_mid_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::RnB => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 58.0, response_gamma: 1.6, spectrum_tilt: 1.5,
+                attack_time_ms: 4.0, decay_time_ms: 320.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
+                eq_bass_db: 1.5, eq_mid_db: 1.0,
+                beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Reggae => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 58.0, response_gamma: 1.6, spectrum_tilt: 1.5,
+                target_dynamic_range_db: 58.0, attack_time_ms: 6.0,
+                decay_time_ms: 330.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
+                eq_bass_db: 2.5, eq_treble_db: -1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Latin => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 58.0, response_gamma: 1.6, spectrum_tilt: 2.5,
+                target_dynamic_range_db: 58.0, attack_time_ms: 2.0,
+                decay_time_ms: 220.0, decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.6,
+                onset_threshold_multiplier: 1.4,
+                eq_mid_db: 1.0, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::HipHop => AudioSettings {
+                fft_size: 2048,
+                window_function: WindowFunction::Hann,
+                sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 1.0,
+                target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
+                decay_time_ms: 250.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                onset_threshold_multiplier: 1.3, eq_bass_db: 2.5,
+                beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Trap => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 25.0, max_frequency_hz: 14_000.0,
+                sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 1.0,
+                target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
+                decay_time_ms: 220.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                onset_threshold_multiplier: 1.3,
+                eq_bass_db: 3.0, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
             AudioPreset::Electronic => AudioSettings {
                 fft_size: 2048,
                 window_function: WindowFunction::Hann,
@@ -831,18 +1195,143 @@ impl AudioPreset {
                 decay_time_ms: 150.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
                 onset_threshold_multiplier: 1.3, bpm_lock_enabled: true,
-                eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass, ..d
+                bpm_phase_smoothing: 0.25, beat_envelope_decay_ms: 100.0,
+                eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
             },
-            AudioPreset::HipHop => AudioSettings {
-                fft_size: 2048,
-                window_function: WindowFunction::Hann,
-                sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 1.0,
-                target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
-                decay_time_ms: 250.0, decay_mode: DecayMode::Gravity,
+
+            AudioPreset::Dance => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 58.0, response_gamma: 1.7, spectrum_tilt: 2.0,
+                target_dynamic_range_db: 52.0, attack_time_ms: 1.0,
+                decay_time_ms: 170.0, decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.65,
+                onset_threshold_multiplier: 1.35, bpm_lock_enabled: true,
+                eq_bass_db: 1.5, eq_treble_db: 1.5, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Club => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 62.0, response_gamma: 1.8, spectrum_tilt: 1.5,
+                target_dynamic_range_db: 50.0, attack_time_ms: 0.0,
+                decay_time_ms: 140.0, decay_mode: DecayMode::Gravity,
+                gravity_coefficient: 1.2,
+                average_size: 1, beat_detection_sensitivity: 0.75,
+                onset_threshold_multiplier: 1.25, bpm_lock_enabled: true,
+                beat_envelope_decay_ms: 100.0,
+                eq_bass_db: 2.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::House => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 60.0, response_gamma: 1.7, spectrum_tilt: 1.5,
+                target_dynamic_range_db: 52.0, attack_time_ms: 1.0,
+                decay_time_ms: 180.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
-                onset_threshold_multiplier: 1.3, eq_bass_db: 2.5,
-                beat_focus: BeatFocusMode::Bass, ..d
+                onset_threshold_multiplier: 1.3, bpm_lock_enabled: true,
+                eq_bass_db: 2.0, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
             },
+
+            AudioPreset::Deep => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 25.0, max_frequency_hz: 12_000.0,
+                sensitivity: 62.0, response_gamma: 1.6, spectrum_tilt: 0.5,
+                target_dynamic_range_db: 55.0, attack_time_ms: 2.0,
+                decay_time_ms: 320.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, frequency_smoothing: 0.15,
+                beat_detection_sensitivity: 0.6, onset_threshold_multiplier: 1.4,
+                bpm_lock_enabled: true,
+                eq_bass_db: 3.0, eq_treble_db: -2.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Techno => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 62.0, response_gamma: 1.9, spectrum_tilt: 1.0,
+                target_dynamic_range_db: 48.0, attack_time_ms: 0.0,
+                decay_time_ms: 120.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.75,
+                onset_threshold_multiplier: 1.25, bpm_lock_enabled: true,
+                beat_envelope_decay_ms: 90.0,
+                eq_bass_db: 2.0, eq_treble_db: 1.5, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Trance => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 60.0, response_gamma: 1.6, spectrum_tilt: 2.0,
+                target_dynamic_range_db: 55.0, attack_time_ms: 3.0,
+                decay_time_ms: 220.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, frequency_smoothing: 0.10,
+                beat_detection_sensitivity: 0.65, onset_threshold_multiplier: 1.35,
+                bpm_lock_enabled: true,
+                eq_bass_db: 1.0, eq_treble_db: 1.5, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::DrumAndBass => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 62.0, response_gamma: 1.8, spectrum_tilt: 1.5,
+                target_dynamic_range_db: 50.0, attack_time_ms: 0.0,
+                decay_time_ms: 100.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.75,
+                onset_threshold_multiplier: 1.3, bpm_lock_enabled: true,
+                beat_envelope_decay_ms: 80.0,
+                eq_bass_db: 2.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Dubstep => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 25.0, max_frequency_hz: 14_000.0,
+                sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 0.5,
+                target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
+                decay_time_ms: 200.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                onset_threshold_multiplier: 1.3,
+                eq_bass_db: 3.0, eq_mid_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::Synthwave => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::BlackmanHarris,
+                sensitivity: 60.0, response_gamma: 1.6, spectrum_tilt: 2.0,
+                target_dynamic_range_db: 56.0, attack_time_ms: 3.0,
+                decay_time_ms: 260.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, frequency_smoothing: 0.10,
+                beat_detection_sensitivity: 0.6, onset_threshold_multiplier: 1.4,
+                bpm_lock_enabled: true,
+                eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::BassBoost => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 25.0, max_frequency_hz: 8_000.0,
+                sensitivity: 65.0, response_gamma: 1.9, spectrum_tilt: 0.0,
+                target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
+                decay_time_ms: 230.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                onset_threshold_multiplier: 1.3,
+                eq_bass_db: 5.0, eq_mid_db: -1.0, eq_treble_db: -3.0,
+                beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
+            AudioPreset::HighEnergy => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 65.0, response_gamma: 1.9, spectrum_tilt: 1.5,
+                target_dynamic_range_db: 48.0, attack_time_ms: 0.0,
+                decay_time_ms: 140.0, decay_mode: DecayMode::Gravity,
+                average_size: 1, beat_detection_sensitivity: 0.75,
+                onset_threshold_multiplier: 1.25, bpm_lock_enabled: true,
+                eq_bass_db: 2.0, eq_treble_db: 2.0, beat_focus: BeatFocusMode::Bass,
+                ..d
+            },
+
             AudioPreset::Classical => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -104.0, max_decibels: -24.0, target_dynamic_range_db: 75.0,
@@ -850,9 +1339,25 @@ impl AudioPreset {
                 agc_enabled: false, attack_time_ms: 15.0, decay_time_ms: 500.0,
                 decay_mode: DecayMode::Linear, average_size: 3,
                 beat_detection_sensitivity: 0.4, onset_threshold_multiplier: 1.8,
+                beat_envelope_decay_ms: 250.0,
                 max_frequency_hz: 18000.0,
-                beat_focus: BeatFocusMode::Mid, ..d
+                beat_focus: BeatFocusMode::Mid,
+                ..d
             },
+
+            AudioPreset::Cinematic => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
+                max_frequency_hz: 18_000.0,
+                min_decibels: -104.0, max_decibels: -26.0, target_dynamic_range_db: 72.0,
+                sensitivity: 65.0, response_gamma: 1.25, spectrum_tilt: 4.0,
+                agc_enabled: false, attack_time_ms: 20.0, decay_time_ms: 650.0,
+                decay_mode: DecayMode::Exponential, average_size: 3,
+                beat_detection_sensitivity: 0.3, onset_threshold_multiplier: 1.9,
+                beat_envelope_decay_ms: 300.0,
+                eq_bass_db: 1.5, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
             AudioPreset::Piano => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -99.0, max_decibels: -29.0, target_dynamic_range_db: 65.0,
@@ -862,24 +1367,30 @@ impl AudioPreset {
                 onset_threshold_multiplier: 1.6,
                 max_frequency_hz: 5000.0, eq_mid_db: 1.0,
                 peak_bloom: true,
-                beat_focus: BeatFocusMode::Mid, ..d
+                beat_focus: BeatFocusMode::Mid,
+                ..d
             },
-            AudioPreset::Jazz => AudioSettings {
-                fft_size: 2048, window_function: WindowFunction::Hamming,
-                min_decibels: -90.0, max_decibels: -27.0, target_dynamic_range_db: 60.0,
-                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
-                attack_time_ms: 10.0, decay_time_ms: 400.0, decay_mode: DecayMode::Exponential,
-                average_size: 3, beat_detection_sensitivity: 0.45,
-                onset_threshold_multiplier: 1.6, ..d
-            },
+
             AudioPreset::Ambient => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -104.0, max_decibels: -34.0, target_dynamic_range_db: 70.0,
                 sensitivity: 70.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 attack_time_ms: 40.0, decay_time_ms: 800.0, decay_mode: DecayMode::Exponential,
-                average_size: 6, beat_detection_sensitivity: 0.3,
+                average_size: 6, frequency_smoothing: 0.25,
+                beat_detection_sensitivity: 0.3,
                 onset_threshold_multiplier: 1.8,
                 agc_enabled: false,
+                ..d
+            },
+
+            AudioPreset::Chill => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
+                sensitivity: 62.0, response_gamma: 1.3, spectrum_tilt: 3.5,
+                target_dynamic_range_db: 62.0, attack_time_ms: 20.0,
+                decay_time_ms: 600.0, decay_mode: DecayMode::Exponential,
+                average_size: 4, frequency_smoothing: 0.20,
+                beat_detection_sensitivity: 0.3, onset_threshold_multiplier: 1.8,
+                eq_bass_db: 1.0, eq_treble_db: -1.5, beat_focus: BeatFocusMode::Bass,
                 ..d
             },
 
@@ -893,36 +1404,22 @@ impl AudioPreset {
                 onset_threshold_multiplier: 1.6, chroma_enabled: false,
                 max_frequency_hz: 10_000.0,
                 eq_treble_db: -4.0,
-                beat_focus: BeatFocusMode::Bass, ..d
+                beat_focus: BeatFocusMode::Bass,
+                ..d
             },
-            AudioPreset::Metal => AudioSettings {
-                fft_size: 2048, window_function: WindowFunction::Hamming,
-                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 55.0,
-                sensitivity: 60.0, response_gamma: 1.5, spectrum_tilt: 1.0,
-                attack_time_ms: 1.0, decay_time_ms: 180.0,
-                decay_mode: DecayMode::Exponential,
-                average_size: 1, beat_detection_sensitivity: 0.7,
-                onset_threshold_multiplier: 1.6, eq_mid_db: 2.5, eq_treble_db: 1.0,
-                beat_focus: BeatFocusMode::Mid, ..d
-            },
-            AudioPreset::Country => AudioSettings {
+
+            AudioPreset::NightMode => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hann,
-                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.0,
-                attack_time_ms: 6.0, decay_time_ms: 300.0,
-                average_size: 2, beat_detection_sensitivity: 0.5,
-                onset_threshold_multiplier: 1.5,
-                eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid, ..d
+                min_decibels: -100.0, max_decibels: -40.0, target_dynamic_range_db: 70.0,
+                sensitivity: 75.0, response_gamma: 1.2, spectrum_tilt: 2.5,
+                attack_time_ms: 15.0, decay_time_ms: 500.0,
+                decay_mode: DecayMode::Exponential, average_size: 3,
+                noise_gate: 0.03,
+                beat_detection_sensitivity: 0.3, onset_threshold_multiplier: 1.8,
+                eq_bass_db: -2.0,
+                ..d
             },
-            AudioPreset::RnB => AudioSettings {
-                fft_size: 2048, window_function: WindowFunction::Hann,
-                sensitivity: 58.0, response_gamma: 1.6, spectrum_tilt: 1.5,
-                attack_time_ms: 4.0, decay_time_ms: 320.0,
-                decay_mode: DecayMode::Exponential,
-                average_size: 2, beat_detection_sensitivity: 0.5,
-                onset_threshold_multiplier: 1.5,
-                eq_bass_db: 1.5, eq_mid_db: 1.0,
-                beat_focus: BeatFocusMode::Bass, ..d
-            },
+
             AudioPreset::Vocal => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::Hann,
                 min_frequency_hz: 80.0, max_frequency_hz: 12000.0,
@@ -931,10 +1428,11 @@ impl AudioPreset {
                 attack_time_ms: 10.0, decay_time_ms: 400.0,
                 average_size: 3, beat_detection_sensitivity: 0.3,
                 onset_threshold_multiplier: 1.8,
-                chroma_enabled: true,
                 eq_bass_db: -3.0, eq_mid_db: 2.0,
-                beat_focus: BeatFocusMode::Mid, ..d
+                beat_focus: BeatFocusMode::Mid,
+                ..d
             },
+
             AudioPreset::Podcast => AudioSettings {
                 fft_size: 2048,
                 window_function: WindowFunction::BlackmanHarris,
@@ -944,12 +1442,36 @@ impl AudioPreset {
                 attack_time_ms: 8.0,
                 decay_time_ms: 600.0,
                 decay_mode: DecayMode::Exponential,
-                average_size: 3,
+                average_size: 3, frequency_smoothing: 0.20,
                 beat_detection_sensitivity: 0.15,
                 onset_threshold_multiplier: 2.0, chroma_enabled: false,
                 eq_bass_db: -4.0, eq_mid_db: 2.5, eq_treble_db: -1.0,
-                beat_focus: BeatFocusMode::Mid, ..d
+                beat_focus: BeatFocusMode::Mid,
+                ..d
             },
+
+            AudioPreset::Live => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                sensitivity: 58.0, response_gamma: 1.5, spectrum_tilt: 2.5,
+                target_dynamic_range_db: 62.0, attack_time_ms: 4.0,
+                decay_time_ms: 260.0, decay_mode: DecayMode::Exponential,
+                average_size: 2, noise_gate: 0.03,
+                beat_detection_sensitivity: 0.5, onset_threshold_multiplier: 1.5,
+                eq_bass_db: 1.0, eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
+            AudioPreset::Gaming => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 60.0, response_gamma: 1.5, spectrum_tilt: 2.5,
+                target_dynamic_range_db: 58.0, attack_time_ms: 2.0,
+                decay_time_ms: 200.0, decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5, chroma_enabled: false,
+                eq_mid_db: 1.0, eq_treble_db: 1.5, beat_focus: BeatFocusMode::Mid,
+                ..d
+            },
+
         }
     }
     pub fn apply(self, s: &mut AudioSettings) {
@@ -1016,7 +1538,43 @@ fn default_color_presets() -> Vec<ColorPreset> {
         [255, 0, 0], [255, 128, 0], [255, 255, 0], [128, 255, 0], [0, 255, 0], [0, 255, 128],
         [0, 255, 255], [0, 128, 255], [0, 0, 255], [128, 0, 255], [255, 0, 255], [255, 0, 128],
         [255, 255, 255], [200, 200, 200], [150, 150, 150], [100, 100, 100], [50, 50, 50], [0, 0, 0],
-        [255, 105, 180], [255, 165, 0], [75, 0, 130], [0, 191, 255], [34, 139, 34], [139, 69, 19]
+        [255, 105, 180], [255, 165, 0], [75, 0, 130], [0, 191, 255], [34, 139, 34], [139, 69, 19],
+        [255, 127, 80],
+        [250, 128, 114],
+        [255, 203, 164],
+        [255, 174, 99],
+        [255, 215, 0],
+        [225, 173, 1],
+        [128, 128, 0],
+        [191, 255, 0],
+        [152, 255, 152],
+        [0, 168, 107],
+        [80, 200, 120],
+        [0, 128, 128],
+        [64, 224, 208],
+        [127, 255, 212],
+        [135, 206, 235],
+        [0, 127, 255],
+        [0, 71, 171],
+        [0, 0, 128],
+        [63, 0, 255],
+        [138, 43, 226],
+        [181, 126, 220],
+        [218, 112, 214],
+        [244, 0, 161],
+        [255, 102, 153],
+        [220, 20, 60],
+        [128, 0, 32],
+        [128, 0, 0],
+        [123, 63, 0],
+        [194, 178, 128],
+        [255, 253, 208],
+        [255, 255, 240],
+        [112, 128, 144],
+        [70, 130, 180],
+        [192, 192, 192],
+        [200, 240, 255],
+        [57, 255, 20],
     ];
     colors.iter().map(|&c| ColorPreset { color: c, is_premade: true }).collect()
 }
@@ -1046,6 +1604,46 @@ fn default_static_multi_presets() -> Vec<StaticMultiPreset> {
         smp("Bioluminescence",   vec![[0, 50, 100], [0, 150, 200], [0, 255, 200], [100, 255, 150]],            Vertical,   1),
         smp("Candy Cane",        vec![[255, 0, 0], [255, 255, 255], [255, 0, 0], [255, 255, 255]],             Sequential, 1),
         smp("Midnight Sun",      vec![[20, 0, 40], [80, 0, 80], [200, 0, 100], [255, 100, 0]],                 Vertical,   1),
+
+        // ── added in v17 ──
+        smp("Miami Vice", vec![[255, 0, 128], [0, 229, 255], [255, 255, 255]], Vertical, 1),
+        smp("Tokyo Night", vec![[15, 10, 50], [120, 0, 200], [255, 0, 140], [0, 230, 255]], Vertical, 1),
+        smp("Coral Reef", vec![[255, 111, 97], [255, 190, 120], [0, 180, 170], [0, 90, 140]], Blocks, 1),
+        smp("Emerald City", vec![[0, 60, 40], [0, 150, 90], [80, 230, 150], [220, 255, 230]], Vertical, 1),
+        smp("Golden Hour", vec![[255, 140, 0], [255, 190, 60], [255, 230, 150], [255, 250, 220]], Vertical, 1),
+        smp("Blueberry Mint", vec![[40, 40, 140], [90, 110, 230], [120, 230, 190], [220, 255, 240]], Sequential, 2),
+        smp("Volcano", vec![[20, 0, 0], [150, 10, 0], [255, 90, 0], [255, 210, 60]], Vertical, 1),
+        smp("Glacier", vec![[230, 250, 255], [150, 215, 245], [70, 150, 220], [20, 60, 130]], Vertical, 1),
+        smp("Cotton Sky", vec![[255, 200, 221], [255, 175, 204], [189, 224, 254], [162, 210, 255]], Blocks, 1),
+        smp("Matrix", vec![[0, 20, 0], [0, 110, 30], [0, 220, 70], [190, 255, 200]], Vertical, 1),
+        smp("Pride Flag", vec![[228, 3, 3], [255, 140, 0], [255, 237, 0], [0, 128, 38], [36, 64, 142], [115, 41, 130]], Blocks, 1),
+        smp("Ocean Sunset", vec![[255, 94, 98], [255, 153, 102], [130, 90, 200], [20, 40, 110]], Vertical, 1),
+        smp("Neon Tokyo Pop", vec![[255, 0, 170], [0, 255, 200], [255, 235, 0], [120, 0, 255]], Sequential, 3),
+        smp("Cherry Mint", vec![[222, 49, 99], [255, 182, 193], [152, 255, 200], [0, 150, 110]], Random, 1),
+        smp("Espresso", vec![[30, 15, 8], [90, 50, 25], [160, 100, 55], [235, 200, 150]], Vertical, 1),
+        smp("Royal Gold", vec![[40, 10, 90], [100, 40, 170], [220, 170, 40], [255, 235, 150]], Blocks, 1),
+        smp("Poison Ivy", vec![[30, 0, 50], [110, 0, 160], [60, 220, 60], [190, 255, 90]], Random, 1),
+        smp("Arctic Fox", vec![[255, 255, 255], [200, 225, 245], [120, 160, 200], [60, 80, 120]], Sequential, 2),
+        smp("Mojito", vec![[10, 90, 50], [60, 190, 110], [190, 245, 170], [255, 255, 220]], Blocks, 1),
+        smp("Blood Moon", vec![[10, 0, 0], [90, 0, 10], [200, 20, 20], [255, 120, 60]], Vertical, 1),
+        smp("Lavender Fields", vec![[90, 60, 150], [150, 110, 210], [205, 175, 240], [240, 225, 255]], Vertical, 1),
+        smp("Citrus Burst", vec![[255, 242, 0], [255, 170, 0], [255, 100, 0], [130, 210, 40]], Random, 1),
+        smp("Steel Blue Orange", vec![[20, 50, 90], [60, 110, 170], [240, 140, 40], [255, 200, 110]], Blocks, 1),
+        smp("Magma Chamber", vec![[40, 0, 20], [160, 0, 40], [255, 80, 0], [255, 200, 0], [255, 255, 200]], Vertical, 1),
+        smp("Deep Jungle", vec![[5, 40, 25], [20, 100, 50], [110, 170, 40], [240, 200, 60]], Random, 1),
+        smp("Holographic", vec![[255, 150, 200], [160, 150, 255], [110, 230, 255], [150, 255, 200]], Sequential, 1),
+        smp("Dusk Highway", vec![[15, 15, 50], [90, 40, 130], [210, 70, 110], [255, 170, 90]], Vertical, 1),
+        smp("Retro Diner", vec![[230, 50, 60], [250, 240, 220], [40, 160, 170], [30, 30, 40]], Sequential, 2),
+        smp("Spring Meadow", vec![[120, 200, 80], [250, 230, 90], [250, 150, 190], [150, 200, 250]], Random, 1),
+        smp("Black & Gold", vec![[10, 10, 10], [212, 175, 55], [10, 10, 10], [255, 223, 120]], Sequential, 2),
+        smp("Pink Lemonade", vec![[255, 105, 160], [255, 200, 215], [255, 245, 150], [255, 220, 40]], Blocks, 1),
+        smp("Midnight Ocean", vec![[0, 5, 30], [0, 40, 90], [0, 110, 170], [60, 200, 230]], Vertical, 1),
+        smp("Sakura Night", vec![[30, 15, 50], [120, 50, 110], [240, 140, 180], [255, 225, 235]], Vertical, 1),
+        smp("Toxic Waste", vec![[25, 25, 0], [130, 200, 0], [220, 255, 0], [120, 0, 170]], Random, 1),
+        smp("Desert Dusk", vec![[70, 30, 60], [190, 70, 70], [240, 150, 80], [250, 215, 140]], Vertical, 1),
+        smp("Aqua Pop", vec![[0, 200, 255], [0, 120, 255], [255, 70, 170], [255, 220, 60]], Sequential, 4),
+        smp("Ruby Emerald", vec![[180, 0, 50], [240, 60, 100], [0, 130, 90], [60, 220, 150]], Blocks, 1),
+        smp("Silver Lining", vec![[40, 45, 60], [100, 110, 130], [190, 200, 215], [250, 252, 255]], Vertical, 1),
     ]
 }
 
@@ -1073,6 +1671,46 @@ fn default_gradient_presets() -> Vec<GradientPreset> {
         gp("Desert Mirage",    vec![gs([255, 230, 200], 0.0), gs([240, 160, 80], 0.4), gs([180, 80, 30], 1.0)], 0.0),
         gp("Electric Blue",    vec![gs([0, 50, 255], 0.0), gs([0, 200, 255], 0.5), gs([255, 255, 255], 1.0)], 90.0),
         gp("Vintage Sunset",   vec![gs([50, 20, 30], 0.0), gs([200, 80, 60], 0.5), gs([250, 200, 100], 1.0)], 90.0),
+
+        // ── added in v17 ──
+        gp("Miami Sunset", vec![gs([255, 0, 128], 0.0), gs([255, 140, 60], 0.5), gs([255, 230, 120], 1.0)], 90.0),
+        gp("Mojito Breeze", vec![gs([10, 90, 50], 0.0), gs([90, 210, 140], 0.5), gs([235, 255, 215], 1.0)], 90.0),
+        gp("Blueberry", vec![gs([20, 10, 70], 0.0), gs([70, 60, 200], 0.5), gs([170, 170, 255], 1.0)], 90.0),
+        gp("Strawberry Cream", vec![gs([150, 10, 50], 0.0), gs([255, 90, 130], 0.5), gs([255, 230, 235], 1.0)], 90.0),
+        gp("Ember Glow", vec![gs([30, 0, 0], 0.0), gs([200, 40, 0], 0.45), gs([255, 170, 0], 0.8), gs([255, 250, 190], 1.0)], 90.0),
+        gp("Arctic Dawn", vec![gs([10, 30, 80], 0.0), gs([60, 140, 210], 0.4), gs([190, 235, 255], 0.75), gs([255, 255, 255], 1.0)], 90.0),
+        gp("Plum Wine", vec![gs([40, 0, 40], 0.0), gs([130, 20, 90], 0.5), gs([230, 100, 140], 1.0)], 90.0),
+        gp("Lagoon", vec![gs([0, 60, 90], 0.0), gs([0, 170, 170], 0.5), gs([170, 255, 220], 1.0)], 90.0),
+        gp("Toxic Glow", vec![gs([20, 30, 0], 0.0), gs([120, 220, 0], 0.55), gs([240, 255, 120], 1.0)], 90.0),
+        gp("Royal Velvet", vec![gs([30, 0, 70], 0.0), gs([100, 30, 170], 0.5), gs([220, 170, 60], 1.0)], 90.0),
+        gp("Cotton Horizon", vec![gs([255, 190, 220], 0.0), gs([200, 200, 255], 0.5), gs([180, 240, 255], 1.0)], 0.0),
+        gp("Rose Gold", vec![gs([120, 50, 60], 0.0), gs([235, 150, 140], 0.5), gs([255, 225, 200], 1.0)], 90.0),
+        gp("Cyan Fade", vec![gs([0, 20, 40], 0.0), gs([0, 200, 255], 0.7), gs([230, 255, 255], 1.0)], 90.0),
+        gp("Magenta Haze", vec![gs([20, 0, 30], 0.0), gs([200, 0, 170], 0.6), gs([255, 170, 240], 1.0)], 90.0),
+        gp("Forest Mist", vec![gs([10, 40, 20], 0.0), gs([60, 130, 80], 0.5), gs([200, 230, 200], 1.0)], 90.0),
+        gp("Solar Flare", vec![gs([255, 60, 0], 0.0), gs([255, 170, 0], 0.4), gs([255, 255, 120], 0.7), gs([255, 255, 255], 1.0)], 90.0),
+        gp("Deep Sea Neon", vec![gs([0, 10, 40], 0.0), gs([0, 90, 160], 0.4), gs([0, 230, 200], 0.8), gs([190, 255, 240], 1.0)], 90.0),
+        gp("Candy Floss", vec![gs([255, 120, 200], 0.0), gs([255, 200, 230], 0.5), gs([150, 220, 255], 1.0)], 45.0),
+        gp("Dusk to Dawn", vec![gs([20, 20, 70], 0.0), gs([130, 50, 130], 0.35), gs([240, 110, 100], 0.7), gs([255, 210, 130], 1.0)], 90.0),
+        gp("Peacock", vec![gs([0, 60, 80], 0.0), gs([0, 150, 130], 0.35), gs([60, 100, 200], 0.7), gs([140, 60, 200], 1.0)], 0.0),
+        gp("Prism Sweep", vec![gs([255, 0, 80], 0.0), gs([255, 200, 0], 0.25), gs([0, 220, 120], 0.5), gs([0, 150, 255], 0.75), gs([170, 0, 255], 1.0)], 0.0),
+        gp("Monochrome Blue", vec![gs([5, 15, 40], 0.0), gs([30, 80, 170], 0.5), gs([150, 200, 255], 1.0)], 90.0),
+        gp("Sunrise", vec![gs([60, 20, 90], 0.0), gs([230, 80, 90], 0.4), gs([255, 180, 70], 0.75), gs([255, 245, 170], 1.0)], 90.0),
+        gp("Pistachio", vec![gs([60, 90, 30], 0.0), gs([160, 210, 100], 0.55), gs([245, 255, 200], 1.0)], 90.0),
+        gp("Crimson Tide", vec![gs([20, 0, 5], 0.0), gs([140, 0, 30], 0.5), gs([255, 70, 90], 1.0)], 90.0),
+        gp("Frozen Lake", vec![gs([0, 40, 70], 0.0), gs([100, 190, 230], 0.5), gs([235, 250, 255], 1.0)], 270.0),
+        gp("Gold Dust", vec![gs([50, 30, 0], 0.0), gs([190, 140, 30], 0.5), gs([255, 225, 140], 1.0)], 90.0),
+        gp("Orchid Night", vec![gs([15, 0, 35], 0.0), gs([110, 40, 160], 0.5), gs([240, 130, 220], 1.0)], 135.0),
+        gp("Lime Soda", vec![gs([0, 90, 60], 0.0), gs([120, 230, 60], 0.55), gs([255, 255, 130], 1.0)], 90.0),
+        gp("Copper Patina", vec![gs([120, 60, 30], 0.0), gs([200, 140, 70], 0.35), gs([80, 180, 160], 0.75), gs([170, 235, 210], 1.0)], 90.0),
+        gp("Twin Peaks", vec![gs([255, 50, 120], 0.0), gs([20, 0, 40], 0.5), gs([0, 220, 255], 1.0)], 0.0),
+        gp("Hot Tub", vec![gs([0, 70, 120], 0.0), gs([0, 180, 220], 0.5), gs([255, 110, 150], 1.0)], 45.0),
+        gp("Autumn Haze", vec![gs([70, 25, 10], 0.0), gs([200, 90, 30], 0.45), gs([245, 190, 80], 0.8), gs([255, 240, 190], 1.0)], 90.0),
+        gp("Storm Cloud", vec![gs([15, 20, 35], 0.0), gs([70, 85, 120], 0.5), gs([200, 210, 230], 1.0)], 90.0),
+        gp("Bubblegum Pop", vec![gs([255, 60, 160], 0.0), gs([255, 130, 200], 0.4), gs([120, 200, 255], 1.0)], 0.0),
+        gp("Matrix Green", vec![gs([0, 10, 0], 0.0), gs([0, 140, 40], 0.5), gs([170, 255, 190], 1.0)], 90.0),
+        gp("Tangerine Dream", vec![gs([200, 40, 0], 0.0), gs([255, 140, 20], 0.5), gs([255, 220, 150], 1.0)], 90.0),
+        gp("Cosmic Dust", vec![gs([5, 0, 25], 0.0), gs([70, 30, 140], 0.35), gs([200, 90, 170], 0.7), gs([255, 210, 190], 1.0)], 90.0),
     ]
 }
 
@@ -1123,7 +1761,106 @@ fn default_color_change_presets() -> Vec<ColorChangePreset> {
             1.0, ccms(FlipFlop, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
         ccp("Kaleidoscope",      vec![[255, 100, 200], [100, 255, 200], [200, 100, 255]],
             0.4, ccms(Kaleidoscope, Smooth, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 0, 0], 255)),
+
+        // ── added in v17 ──
+        ccp("Triple Heart", vec![[255, 40, 80], [255, 150, 40], [255, 230, 80]],
+            0.45, ccms(Heartbeat, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [20, 0, 10], 160)),
+        ccp("Four Hearts", vec![[255, 60, 120], [120, 60, 255], [0, 200, 255], [80, 255, 160]],
+            0.4, ccms(Heartbeat, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Northern Curtain", vec![[0, 255, 170], [0, 170, 255], [140, 80, 255]],
+            0.3, ccms(AuroraCurtain, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [2, 6, 18], 235)),
+        ccp("Molten Lamp", vec![[255, 70, 0], [255, 190, 0], [200, 0, 90]],
+            0.3, ccms(LavaLamp, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [25, 0, 10], 255)),
+        ccp("Knight Rider", vec![[255, 0, 0], [255, 90, 0], [120, 0, 0]],
+            0.6, ccms(CylonScanner, Smooth, 1.0, 0.45, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Storm Front", vec![[200, 220, 255], [150, 120, 255], [255, 255, 255]],
+            0.6, ccms(Lightning, Smooth, 1.0, 0.35, 0.35, 2.0, 0.1, [5, 5, 25], 255)),
+        ccp("High Tide", vec![[0, 120, 200], [0, 200, 220], [220, 250, 255]],
+            0.3, ccms(OceanTide, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 10, 30], 230)),
+        ccp("Window Rain", vec![[120, 180, 255], [170, 220, 255], [90, 130, 220]],
+            0.55, ccms(RainDrops, Smooth, 1.0, 0.35, 0.5, 2.0, 0.1, [5, 10, 25], 255)),
+        ccp("Snow Globe", vec![[255, 255, 255], [200, 230, 255], [170, 200, 255]],
+            0.4, ccms(Snowfall, Smooth, 1.0, 0.25, 0.5, 2.0, 0.1, [8, 14, 40], 255)),
+        ccp("Summer Night", vec![[210, 255, 90], [255, 230, 80], [150, 255, 150]],
+            0.4, ccms(FireflyGlow, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 8, 4], 255)),
+        ccp("Mirror Ball", vec![[255, 255, 255], [255, 150, 220], [120, 220, 255]],
+            0.5, ccms(DiscoBall, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [10, 0, 20], 255)),
+        ccp("Lighthouse", vec![[255, 245, 200], [255, 200, 90], [255, 255, 255]],
+            0.45, ccms(Searchlight, Smooth, 1.0, 0.3, 0.3, 2.0, 0.1, [0, 0, 15], 255)),
+        ccp("Candy Stripe", vec![[255, 50, 90], [255, 255, 255]],
+            0.4, ccms(BarberPole, Hard, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 0, 0], 255)),
+        ccp("Chess Match", vec![[240, 240, 240], [30, 30, 40], [240, 180, 40]],
+            0.35, ccms(Checkerboard, Hard, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 0, 0], 255)),
+        ccp("Bokeh Evening", vec![[255, 170, 90], [255, 120, 170], [150, 130, 255], [120, 220, 255]],
+            0.3, ccms(BokehLights, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [10, 5, 20], 255)),
+        ccp("DNA Strand", vec![[0, 230, 200], [255, 90, 180], [255, 240, 100]],
+            0.4, ccms(DoubleHelix, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 10], 255)),
+        ccp("Grandfather Clock", vec![[230, 190, 100], [180, 120, 50], [255, 235, 170]],
+            0.4, ccms(Pendulum, Smooth, 1.0, 0.2, 0.3, 2.0, 0.1, [10, 5, 0], 255)),
+        ccp("Head On", vec![[255, 80, 80], [80, 160, 255]],
+            0.55, ccms(TwinComets, Smooth, 1.0, 0.4, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("VU Meter", vec![[60, 230, 80], [255, 230, 40], [255, 50, 40]],
+            0.6, ccms(EqualizerBounce, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [15, 15, 15], 255)),
+        ccp("Color Steps", vec![[255, 60, 90], [255, 170, 40], [80, 220, 120], [60, 140, 255], [170, 80, 255]],
+            0.35, ccms(Stairs, Hard, 1.0, 0.25, 0.3, 5.0, 0.1, [0, 0, 0], 255)),
+        ccp("Cinema Marquee", vec![[255, 220, 120], [255, 120, 60]],
+            0.5, ccms(TheaterChase, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [25, 10, 0], 200)),
+        ccp("Broken Signal", vec![[0, 255, 255], [255, 0, 200], [255, 255, 255]],
+            0.55, ccms(Glitch, Hard, 1.0, 0.25, 0.45, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Saturday Night", vec![[255, 0, 170], [0, 230, 255], [255, 230, 0], [120, 255, 80]],
+            0.5, ccms(DiscoFloor, Hard, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 0, 0], 255)),
+        ccp("Whirlpool", vec![[0, 60, 200], [0, 200, 255], [230, 255, 255]],
+            0.45, ccms(Vortex, Smooth, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 5, 25], 255)),
+        ccp("Big Bang", vec![[255, 255, 255], [255, 180, 60], [255, 60, 30], [120, 0, 80]],
+            0.4, ccms(Supernova, Smooth, 1.0, 0.3, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Open All Night", vec![[255, 40, 120], [60, 220, 255]],
+            0.45, ccms(NeonSign, Smooth, 1.0, 0.25, 0.4, 2.0, 0.1, [15, 0, 10], 230)),
+        ccp("Burst Fire", vec![[255, 255, 255], [255, 80, 160], [80, 200, 255]],
+            0.7, ccms(StrobeBurst, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Shockwave", vec![[255, 90, 0], [255, 220, 0], [255, 255, 255]],
+            0.6, ccms(MirrorPulse, Smooth, 1.0, 0.3, 0.3, 2.0, 0.1, [10, 0, 0], 255)),
+        ccp("Falling Dominoes", vec![[255, 70, 70], [255, 190, 60], [90, 220, 120], [70, 150, 255]],
+            0.4, ccms(DominoFall, Smooth, 1.0, 0.25, 0.3, 2.0, 0.12, [0, 0, 0], 255)),
+        ccp("Candlelight", vec![[255, 170, 50], [255, 120, 20], [255, 210, 110]],
+            0.4, ccms(CandleFlicker, Smooth, 1.0, 0.25, 0.45, 2.0, 0.1, [15, 5, 0], 255)),
+        ccp("Submarine Sonar", vec![[60, 255, 120], [0, 160, 70], [190, 255, 210]],
+            0.35, ccms(RadarSweep, Smooth, 1.0, 0.55, 0.3, 2.0, 0.1, [0, 12, 4], 255)),
+        ccp("Niagara", vec![[90, 200, 255], [200, 245, 255], [30, 110, 200]],
+            0.5, ccms(Waterfall, Smooth, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 15, 40], 255)),
+        ccp("Sunset Waves", vec![[255, 110, 60], [255, 60, 130], [140, 60, 200]],
+            0.4, ccms(SineWave, Smooth, 1.0, 0.25, 0.3, 2.5, 0.1, [0, 0, 0], 255)),
+        ccp("Emerald Pulse", vec![[0, 255, 140], [0, 120, 70]],
+            0.45, ccms(Breathing, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 15, 8], 200)),
+        ccp("Pop Rocks", vec![[255, 0, 150], [0, 255, 220], [255, 230, 0], [150, 80, 255]],
+            0.5, ccms(Confetti, Hard, 1.0, 0.25, 0.6, 2.0, 0.1, [5, 0, 10], 230)),
+        ccp("Ghost Light", vec![[190, 210, 255], [140, 170, 230]],
+            0.35, ccms(Sinelon, Smooth, 1.0, 0.6, 0.3, 2.0, 0.1, [0, 0, 12], 255)),
+        ccp("Rainbow Road", vec![[255, 0, 0], [255, 200, 0], [0, 255, 100], [0, 150, 255], [200, 0, 255]],
+            0.55, ccms(RainbowCycle, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Aurora Tide", vec![[0, 255, 200], [80, 120, 255]],
+            0.35, ccms(TriangleWave, Smooth, 1.0, 0.25, 0.3, 1.5, 0.1, [0, 0, 0], 255)),
     ]
+}
+
+// Built-in presets are regenerated on every launch (see `refresh_premade_presets`),
+// so only the user's own presets are written to disk. This keeps config.toml small
+// and makes the settings-change fingerprint much cheaper to compute.
+trait PremadeFlag { fn is_premade_preset(&self) -> bool; }
+impl PremadeFlag for ColorPreset { fn is_premade_preset(&self) -> bool { self.is_premade } }
+impl PremadeFlag for StaticMultiPreset { fn is_premade_preset(&self) -> bool { self.is_premade } }
+impl PremadeFlag for GradientPreset { fn is_premade_preset(&self) -> bool { self.is_premade } }
+impl PremadeFlag for ColorChangePreset { fn is_premade_preset(&self) -> bool { self.is_premade } }
+
+fn ser_user_presets<T, S>(v: &Vec<T>, s: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize + PremadeFlag,
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let user: Vec<&T> = v.iter().filter(|p| !p.is_premade_preset()).collect();
+    let mut seq = s.serialize_seq(Some(user.len()))?;
+    for p in user { seq.serialize_element(p)?; }
+    seq.end()
 }
 
 fn deserialize_color_presets<'de, D>(deserializer: D) -> Result<Vec<ColorPreset>, D::Error>
@@ -1517,7 +2254,9 @@ impl ReactivePreset {
                 pitch_highlight: true, pitch_strength: 0.7, pitch_width_bars: 1.5,
                 pitch_cap_px: 4.0, pitch_harmonics: true, pitch_hold_ms: 250.0,
                 pitch_glide_ms: 60.0,
-                ghost_line: true, ghost_opacity: 140, ghost_thickness: 1.0,
+                // Spectrum ghost line deliberately OFF: on piano / acoustic material
+                // it just traces the bars and looks like a second outline.
+                ghost_line: false,
                 ..d
             },
 
@@ -1548,7 +2287,8 @@ impl ReactivePreset {
                 pitch_cap_px: 5.0, pitch_outline: true, pitch_harmonics: true,
                 pitch_harmonic_strength: 0.6,
                 chroma_bars: true, chroma_tint: 0.6, chroma_brighten: 0.3, chroma_contrast: 2.0,
-                ghost_line: true, ghost_thickness: 1.5, ghost_opacity: 190,
+                ghost_line: true, ghost_source: GhostSource::RawSpectrum,
+                ghost_thickness: 1.5, ghost_opacity: 190,
                 ..d
             },
 
@@ -1614,6 +2354,7 @@ pub struct AppConfig {
     #[serde(default = "default_open_settings_on_launch")] pub open_settings_on_launch: bool,
     #[serde(default = "default_show_help_text")] pub show_help_text: bool,
     #[serde(default)] pub show_diagnostics: bool,
+    #[serde(default = "default_fps_cap")] pub fps_cap: u32,
 
     // Outlines
     #[serde(default, alias = "bar_outline_enabled")]   pub visualizer_outline_enabled: bool,
@@ -1629,22 +2370,22 @@ pub struct AppConfig {
     #[serde(default = "default_static_multi_source")]  pub static_multi_source: ColorSource,
     #[serde(default)] pub static_mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub sequential_bars_per_color: usize,
-    #[serde(default = "default_static_multi_presets")] pub static_multi_presets: Vec<StaticMultiPreset>,
+    #[serde(default = "default_static_multi_presets", serialize_with = "ser_user_presets")] pub static_multi_presets: Vec<StaticMultiPreset>,
     #[serde(default)] pub vertical_color_style: VerticalColorStyle,
 
     // Gradients
     #[serde(default = "default_gradient_source")] pub gradient_source: GradientSource,
     #[serde(default)] pub gradient_angle: f32,
-    #[serde(default = "default_gradient_presets")] pub gradient_presets: Vec<GradientPreset>,
+    #[serde(default = "default_gradient_presets", serialize_with = "ser_user_presets")] pub gradient_presets: Vec<GradientPreset>,
 
     // Animated
     #[serde(default = "default_animated_source")] pub animated_source: ColorSource,
     #[serde(default = "default_speed")] pub color_change_speed: f32,
-    #[serde(default = "default_color_change_presets")] pub color_change_presets: Vec<ColorChangePreset>,
+    #[serde(default = "default_color_change_presets", serialize_with = "ser_user_presets")] pub color_change_presets: Vec<ColorChangePreset>,
     #[serde(default)] pub color_change_motion: MotionSettings,
 
     // Presets
-    #[serde(default = "default_color_presets", deserialize_with = "deserialize_color_presets")] pub color_presets: Vec<ColorPreset>,
+    #[serde(default = "default_color_presets", deserialize_with = "deserialize_color_presets", serialize_with = "ser_user_presets")] pub color_presets: Vec<ColorPreset>,
 
     // Track info / audio
     #[serde(default)] pub track_info: TrackInfoConfig,
@@ -1671,6 +2412,7 @@ fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
 fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
 fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
 fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
+fn default_fps_cap() -> u32 { DEFAULT_FPS_CAP }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -1686,6 +2428,7 @@ impl Default for AppConfig {
             open_settings_on_launch: DEFAULT_OPEN_SETTINGS_ON_LAUNCH,
             show_help_text: DEFAULT_SHOW_HELP_TEXT,
             show_diagnostics: false,
+            fps_cap: DEFAULT_FPS_CAP,
             visualizer_outline_enabled: false,
             visualizer_outline_thickness: default_visualizer_outline_thickness(),
             visualizer_outline_color: default_visualizer_outline_color(),
@@ -1726,39 +2469,28 @@ impl AppConfig {
     }
 
     fn refresh_premade_presets(&mut self) {
-        let has_any_premade = self.static_multi_presets.iter().any(|p| p.is_premade)
-            || self.gradient_presets.iter().any(|p| p.is_premade)
-            || self.color_change_presets.iter().any(|p| p.is_premade)
-            || self.color_presets.iter().any(|p| p.is_premade);
-
-        if !has_any_premade {
-            self.color_presets = default_color_presets();
-            self.static_multi_presets = default_static_multi_presets();
-            self.gradient_presets = default_gradient_presets();
-            self.color_change_presets = default_color_change_presets();
-            return;
-        }
-
+        // Drop every stored built-in preset and put the current set in front of
+        // the user's own presets (which are always kept).
+        let premade_colors: Vec<[u8; 3]> = default_color_presets().iter().map(|p| p.color).collect();
         self.color_presets.retain(|p| !p.is_premade);
+        // Old config files stored the built-in swatches as plain user colours.
+        self.color_presets.retain(|p| !premade_colors.contains(&p.color));
         self.static_multi_presets.retain(|p| !p.is_premade);
         self.gradient_presets.retain(|p| !p.is_premade);
         self.color_change_presets.retain(|p| !p.is_premade);
 
-        let mut new_cp = default_color_presets();
-        new_cp.append(&mut self.color_presets);
-        self.color_presets = new_cp;
-
-        let mut new_smp = default_static_multi_presets();
-        new_smp.append(&mut self.static_multi_presets);
-        self.static_multi_presets = new_smp;
-
-        let mut new_gp = default_gradient_presets();
-        new_gp.append(&mut self.gradient_presets);
-        self.gradient_presets = new_gp;
-
-        let mut new_ccp = default_color_change_presets();
-        new_ccp.append(&mut self.color_change_presets);
-        self.color_change_presets = new_ccp;
+        let mut v = default_color_presets();
+        v.append(&mut self.color_presets);
+        self.color_presets = v;
+        let mut v = default_static_multi_presets();
+        v.append(&mut self.static_multi_presets);
+        self.static_multi_presets = v;
+        let mut v = default_gradient_presets();
+        v.append(&mut self.gradient_presets);
+        self.gradient_presets = v;
+        let mut v = default_color_change_presets();
+        v.append(&mut self.color_change_presets);
+        self.color_change_presets = v;
     }
 
     fn migrate(&mut self) -> bool {
