@@ -657,7 +657,6 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text", "shadow", "outline"]),
     (SettingsTab::Display, "Background", &["background", "bg", "opacity"]),
     (SettingsTab::Display, "Menu & Display", &["scale", "size", "help", "launch", "fps", "vsync", "frame", "diagnostics"]),
-    (SettingsTab::Display, "Performance", &["performance", "fps", "frame rate", "cap", "gpu", "cpu"]),
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -845,12 +844,6 @@ struct VisualizerApp {
 
     mesh: MeshBuilder,
     fx: reactive::FxState,
-
-    /// Frame-rate cap plumbing: the audio thread only wakes the UI if at least
-    /// `wake_interval_us` microseconds have passed since the last rendered frame.
-    wake_interval_us: Arc<AtomicU64>,
-    wake_last_us: Arc<AtomicU64>,
-    wake_t0: Instant,
 }
 
 impl VisualizerApp {
@@ -858,21 +851,7 @@ impl VisualizerApp {
         let config = AppConfig::load();
 
         let audio_ctx = ctx.clone();
-        let wake_interval_us = Arc::new(AtomicU64::new(Self::fps_interval_us(config.fps_cap)));
-        let wake_last_us = Arc::new(AtomicU64::new(0));
-        let wake_t0 = Instant::now();
-        let engine = {
-            let iv = wake_interval_us.clone();
-            let last = wake_last_us.clone();
-            // Audio frames wake the UI, but never faster than the frame-rate cap.
-            AudioEngine::new(config.audio.clone(), move || {
-                let now = wake_t0.elapsed().as_micros() as u64;
-                let min_gap = iv.load(Ordering::Relaxed);
-                if now.saturating_sub(last.load(Ordering::Relaxed)) >= min_gap {
-                    audio_ctx.request_repaint();
-                }
-            })
-        };
+        let engine = AudioEngine::new(config.audio.clone(), move || audio_ctx.request_repaint());
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
@@ -1037,14 +1016,7 @@ impl VisualizerApp {
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
             fx: reactive::FxState::new(),
-            wake_interval_us,
-            wake_last_us,
-            wake_t0,
         }
-    }
-
-    fn fps_interval_us(cap: u32) -> u64 {
-        if cap == 0 { 0 } else { 1_000_000 / cap.max(1) as u64 }
     }
 
     fn visual_num_bars(&self) -> usize {
@@ -5004,32 +4976,6 @@ impl SettingsState {
             self.config.show_help_text,
             "Live capture/analysis stats, sample rate, dropped frames, BPM, onsets.",
         );
-
-        section_header(ui, "Performance");
-        ui.horizontal(|ui| {
-            ui.label("Frame Rate Cap:");
-            let label = if self.config.fps_cap == 0 {
-                "Monitor refresh".to_string()
-            } else {
-                format!("{} fps", self.config.fps_cap)
-            };
-            egui::ComboBox::from_id_source("fps_cap")
-                .selected_text(label)
-                .show_ui(ui, |ui| {
-                    for v in [30u32, 45, 60, 90, 120, 144, 0] {
-                        let name = if v == 0 { "Monitor refresh".to_string() } else { format!("{v} fps") };
-                        ui.selectable_value(&mut self.config.fps_cap, v, name);
-                    }
-                });
-            reset_btn(ui, self.config.fps_cap != DEFAULT_FPS_CAP, || {
-                self.config.fps_cap = DEFAULT_FPS_CAP
-            });
-        });
-        help_text(
-            ui,
-            self.config.show_help_text,
-            "Limits how often the overlay is redrawn. 60 fps looks smooth and cuts GPU / Desktop Window Manager load a lot on 120-240 Hz monitors. Choose 'Monitor refresh' for the old behaviour.",
-        );
     }
 
     fn draw_dynamic_palette_settings(
@@ -5348,12 +5294,7 @@ impl VisualizerApp {
             || self.last_rms > 0.001
             || (self.last_beat_in > 0.0 && self.last_beat_in < 0.5);
         if has_audio {
-            let iv = Self::fps_interval_us(self.config.fps_cap);
-            if iv == 0 {
-                ctx.request_repaint();
-            } else {
-                ctx.request_repaint_after(Duration::from_micros(iv));
-            }
+            ctx.request_repaint();
             return;
         }
 
@@ -5382,7 +5323,6 @@ impl eframe::App for VisualizerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
-        self.wake_last_us.store(self.wake_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
         if dt > 0.0 && dt < 0.1 {
@@ -5417,8 +5357,6 @@ impl eframe::App for VisualizerApp {
             self.seen_gen = generation;
             let mut st = lock_state(&self.shared);
             self.config = st.config.clone();
-            self.wake_interval_us
-                .store(Self::fps_interval_us(self.config.fps_cap), Ordering::Relaxed);
             match st.fx_reset {
                 1 => self.fx.dynamics.reset_track(),
                 2 => self.fx.dynamics.reset_all(),
