@@ -1,5 +1,5 @@
 [package]
-name = "SABI NEIRO"
+name = "visualizer-app"
 version = "17.0.0"
 edition = "2026"
 
