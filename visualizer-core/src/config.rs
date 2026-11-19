@@ -2336,7 +2336,7 @@ pub struct CustomReactivePreset {
 
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AppConfig {
     // Layout
     pub bar_width: f32, pub bar_gap: f32, pub bar_radius: f32,
@@ -2463,7 +2463,7 @@ impl AppConfig {
             .join("RustVisualizer").join("config.toml")
     }
 
-    fn refresh_premade_presets(&mut self) {
+    pub fn refresh_premade_presets(&mut self) {
         // Drop every stored built-in preset and put the current set in front of
         // the user's own presets (which are always kept).
         let premade_colors: Vec<[u8; 3]> = default_color_presets().iter().map(|p| p.color).collect();
