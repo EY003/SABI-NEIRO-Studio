@@ -39,14 +39,14 @@ jobs:
       with:
         name: SABI NEIRO
         # Uploads the final .exe from the target/release folder
-        path: target/release/SABI NEIRO.exe
+        path: target/release/visualizer-app.exe
         if-no-files-found: error
 
     - name: Create GitHub Release (Only on Tags)
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
-        files: target/release/SABI NEIRO.exe
+        files: target/release/visualizer-app.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
