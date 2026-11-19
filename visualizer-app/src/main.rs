@@ -34,7 +34,7 @@ use tray_icon::{
 };
 
 /// Title of the single overlay window (used to find its HWND).
-const OVERLAY_TITLE: &str = "Rust Visualizer Overlay";
+const OVERLAY_TITLE: &str = "SABI NEIRO Overlay";
 
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
@@ -67,6 +67,25 @@ fn hash_u32(mut x: u32) -> u32 {
 
 fn tri01(t: f32) -> f32 { 1.0 - (2.0 * t.fract() - 1.0).abs() }
 
+/// Hash to a float in 0..=1.
+fn hash01(x: u32) -> f32 { (hash_u32(x) & 0xFFFF) as f32 / 65535.0 }
+
+/// Gaussian bump: 1.0 at `d == 0`, falling off with width `w`.
+fn gauss(d: f32, w: f32) -> f32 {
+    let r = d / w.max(1e-3);
+    (-(r * r)).exp()
+}
+
+/// Smooth 1-D value noise (0..1), continuous in `x`.
+fn value_noise(x: f32) -> f32 {
+    let i = x.floor();
+    let f = x - i;
+    let a = hash01(i as i32 as u32);
+    let b = hash01((i as i32).wrapping_add(1) as u32);
+    let u = f * f * (3.0 - 2.0 * f);
+    a + (b - a) * u
+}
+
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -78,6 +97,16 @@ fn wipe_blend(pos: f32, boundary: f32, softness: f32, hard: bool) -> f32 {
     } else {
         smoothstep(boundary - softness, boundary + softness, pos)
     }
+}
+
+/// Position of `p` along the frequency axis (0..1) of the visualizer rectangle.
+/// Left/Right bars are laid out vertically, so their frequency axis is Y.
+fn perp_norm(dir: VisualizerDirection, p: egui::Pos2, r: egui::Rect) -> f32 {
+    let v = match dir {
+        VisualizerDirection::Up | VisualizerDirection::Down => (p.x - r.left()) / r.width().max(1.0),
+        VisualizerDirection::Left | VisualizerDirection::Right => (p.y - r.top()) / r.height().max(1.0),
+    };
+    v.clamp(0.0, 1.0)
 }
 
 fn lerp_color(c1: egui::Color32, c2: egui::Color32, t: f32) -> egui::Color32 {
@@ -628,6 +657,7 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text", "shadow", "outline"]),
     (SettingsTab::Display, "Background", &["background", "bg", "opacity"]),
     (SettingsTab::Display, "Menu & Display", &["scale", "size", "help", "launch", "fps", "vsync", "frame", "diagnostics"]),
+    (SettingsTab::Display, "Performance", &["performance", "fps", "frame rate", "cap", "gpu", "cpu"]),
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -815,6 +845,12 @@ struct VisualizerApp {
 
     mesh: MeshBuilder,
     fx: reactive::FxState,
+
+    /// Frame-rate cap plumbing: the audio thread only wakes the UI if at least
+    /// `wake_interval_us` microseconds have passed since the last rendered frame.
+    wake_interval_us: Arc<AtomicU64>,
+    wake_last_us: Arc<AtomicU64>,
+    wake_t0: Instant,
 }
 
 impl VisualizerApp {
@@ -822,7 +858,21 @@ impl VisualizerApp {
         let config = AppConfig::load();
 
         let audio_ctx = ctx.clone();
-        let engine = AudioEngine::new(config.audio.clone(), move || audio_ctx.request_repaint());
+        let wake_interval_us = Arc::new(AtomicU64::new(Self::fps_interval_us(config.fps_cap)));
+        let wake_last_us = Arc::new(AtomicU64::new(0));
+        let wake_t0 = Instant::now();
+        let engine = {
+            let iv = wake_interval_us.clone();
+            let last = wake_last_us.clone();
+            // Audio frames wake the UI, but never faster than the frame-rate cap.
+            AudioEngine::new(config.audio.clone(), move || {
+                let now = wake_t0.elapsed().as_micros() as u64;
+                let min_gap = iv.load(Ordering::Relaxed);
+                if now.saturating_sub(last.load(Ordering::Relaxed)) >= min_gap {
+                    audio_ctx.request_repaint();
+                }
+            })
+        };
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
@@ -848,7 +898,7 @@ impl VisualizerApp {
         tray_menu.append_items(&[&settings_item, &quit_item]).unwrap();
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
-            .with_tooltip("Rust Music Visualizer")
+            .with_tooltip(format!("{} {}", cfg::APP_NAME, cfg::APP_VERSION))
             .with_icon(tray_icon_img)
             .build()
             .unwrap();
@@ -987,7 +1037,14 @@ impl VisualizerApp {
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
             fx: reactive::FxState::new(),
+            wake_interval_us,
+            wake_last_us,
+            wake_t0,
         }
+    }
+
+    fn fps_interval_us(cap: u32) -> u64 {
+        if cap == 0 { 0 } else { 1_000_000 / cap.max(1) as u64 }
     }
 
     fn visual_num_bars(&self) -> usize {
@@ -1423,8 +1480,18 @@ impl VisualizerApp {
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::Gradient => {
+                // The angle is defined in the bar's own frame: 0 deg runs along the
+                // frequency axis (low -> high), 90 deg runs from the base of the bars
+                // to their tips. Rotate it into screen space for the chosen direction so
+                // every preset looks the same whichever way the bars grow.
                 let angle_rad = self.config.gradient_angle.to_radians();
-                let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
+                let (ca, sa) = (angle_rad.cos(), angle_rad.sin());
+                let dir = match self.config.visualizer_direction {
+                    VisualizerDirection::Down => egui::vec2(ca, sa),
+                    VisualizerDirection::Up => egui::vec2(ca, -sa),
+                    VisualizerDirection::Right => egui::vec2(sa, ca),
+                    VisualizerDirection::Left => egui::vec2(-sa, ca),
+                };
                 let corners = [
                     rect.left_top(),
                     rect.right_top(),
@@ -1448,8 +1515,16 @@ impl VisualizerApp {
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::Animated => {
-                let norm_x = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                let norm_y = ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                let (norm_x, norm_y) = match self.config.visualizer_direction {
+                    VisualizerDirection::Up | VisualizerDirection::Down => (
+                        ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0),
+                        ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0),
+                    ),
+                    VisualizerDirection::Left | VisualizerDirection::Right => (
+                        ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0),
+                        ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0),
+                    ),
+                };
                 self.sample_color_changing(norm_x, norm_y, time)
             }
         };
@@ -1574,7 +1649,8 @@ impl VisualizerApp {
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Heartbeat => {
-                let beat = base_t.fract();
+                let beat_idx = base_t.floor();
+                let beat = base_t - beat_idx;
                 let k = if hard {
                     if beat < 0.10 {
                         1.0
@@ -1590,7 +1666,19 @@ impl VisualizerApp {
                     let b = (-((beat - 0.22) / 0.04).powi(2)).exp() * 0.7;
                     (a + b).clamp(0.0, 1.0)
                 };
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: 0.0, intensity: k }
+                // Palette position is tied to the heartbeat COUNT, not to the position
+                // inside one beat (which is always < 0.3 while the bars are lit and
+                // therefore only ever reached the first two colours). The first thump
+                // ("lub") shows colour N, the second ("dub") colour N+1, and each
+                // heartbeat advances one step, so every palette colour appears.
+                let n = self.active_palettes.animated_colors.len().max(1) as f32;
+                let t = if hard { (beat >= 0.14) as u8 as f32 } else { smoothstep(0.12, 0.16, beat) };
+                MotionSample {
+                    phase_a: beat_idx / n,
+                    phase_b: (beat_idx + 1.0) / n,
+                    blend_t: t,
+                    intensity: k,
+                }
             }
             MotionShape::Stutter => {
                 let step = (time * 10.0) as u32;
@@ -1705,6 +1793,340 @@ impl VisualizerApp {
                 let dist = ((x * 2.0 - head) % 1.0).abs();
                 let k = (1.0 - dist / 0.15).clamp(0.0, 1.0);
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+            }
+            MotionShape::AuroraCurtain => {
+                let c1 = (x * freq * TAU + base_t * TAU * 0.5).sin();
+                let c2 = (x * freq * 1.7 * TAU - base_t * TAU * 0.3 + 1.3).sin();
+                let curtain = (c1 * 0.6 + c2 * 0.4) * 0.5 + 0.5;
+                let fade = (1.0 - y).clamp(0.0, 1.0).powf(0.8);
+                let k = (curtain * (0.35 + 0.65 * fade)).clamp(0.0, 1.0);
+                MotionSample { phase_a: base_t * 0.2 + curtain * 0.35 + y * 0.15, intensity: k, ..Default::default() }
+            }
+            MotionShape::LavaLamp => {
+                let t = base_t * TAU;
+                let blobs = [
+                    (0.5 + 0.40 * (t * 0.31).sin(), 0.5 + 0.35 * (t * 0.43 + 1.0).cos()),
+                    (0.5 + 0.35 * (t * 0.23 + 2.1).cos(), 0.5 + 0.40 * (t * 0.37 + 0.4).sin()),
+                    (0.5 + 0.45 * (t * 0.19 + 4.0).sin(), 0.5 + 0.30 * (t * 0.29 + 3.0).cos()),
+                ];
+                let mut field = 0.0f32;
+                for (cx, cy) in blobs {
+                    let dx = x - cx;
+                    let dy = (y - cy) * 0.8;
+                    field += 0.02 / (dx * dx + dy * dy + 0.01);
+                }
+                let k = if hard { (field > 0.6) as u8 as f32 } else { smoothstep(0.35, 1.0, field) };
+                MotionSample { phase_a: base_t * 0.25 + field * 0.15, intensity: k, ..Default::default() }
+            }
+            MotionShape::CylonScanner => {
+                let ph = base_t * 0.5;
+                let head = tri01(ph);
+                let forward = ph.fract() < 0.5;
+                let d = if forward { head - x } else { x - head };
+                let tail = m.trail_length.max(0.05);
+                let k = if d < 0.0 {
+                    gauss(d, 0.015)
+                } else {
+                    (1.0 - d / tail).clamp(0.0, 1.0).powf(1.5)
+                };
+                let k = if hard { (k > 0.35) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.2, intensity: k, ..Default::default() }
+            }
+            MotionShape::Lightning => {
+                let s = base_t * 3.0;
+                let slot = s.floor() as u32;
+                let local = s - s.floor();
+                let h = hash01(slot.wrapping_mul(7919).wrapping_add(13));
+                let strike = h < 0.10 + m.stutter_intensity * 0.5;
+                let bolt_x = hash01(slot.wrapping_mul(104_729).wrapping_add(7));
+                let flash = (-local * 7.0).exp() * (0.75 + 0.25 * (local * 40.0).sin().abs());
+                let spread = 0.10 + m.trail_length * 0.5;
+                let spatial = 0.30 + 0.70 * gauss(x - bolt_x, spread);
+                let k = if strike { (flash * spatial).clamp(0.0, 1.0) } else { 0.0 };
+                let k = if hard { (k > 0.3) as u8 as f32 } else { k };
+                MotionSample { phase_a: hash01(slot.wrapping_mul(31).wrapping_add(99)), intensity: k, ..Default::default() }
+            }
+            MotionShape::OceanTide => {
+                let level = 0.5 + 0.28 * (base_t * TAU * 0.5).sin();
+                let surf = level + 0.04 * (x * 9.0 + base_t * TAU * 2.0).sin();
+                let above = if hard { (y > surf) as u8 as f32 } else { smoothstep(surf - 0.04, surf + 0.04, y) };
+                let foam = gauss(y - surf, 0.035);
+                let pa = base_t * 0.1 + (1.0 - y) * 0.3;
+                MotionSample { phase_a: pa, phase_b: pa + 0.5, blend_t: foam, intensity: 1.0 - above * 0.85 }
+            }
+            MotionShape::RainDrops => {
+                let col = (x * 60.0) as u32;
+                let h = hash01(col.wrapping_mul(2_654_435_761u32 >> 8).wrapping_add(3));
+                let speed = 0.6 + h * 0.9;
+                let offs = hash01(col.wrapping_add(977));
+                let active = hash01(col.wrapping_add(4242)) < 0.25 + m.stutter_intensity * 0.75;
+                let pos = (base_t * speed + offs).fract();
+                let head = 1.0 - pos;
+                let dd = y - head;
+                let tail = 0.12 + m.trail_length * 0.5;
+                let k = if !active {
+                    0.0
+                } else if dd >= 0.0 {
+                    (1.0 - dd / tail).clamp(0.0, 1.0)
+                } else {
+                    gauss(dd, 0.02)
+                };
+                let k = if hard { (k > 0.3) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.1 + h, intensity: k, ..Default::default() }
+            }
+            MotionShape::Snowfall => {
+                let col = (x * 48.0) as u32;
+                let h = hash01(col.wrapping_mul(40_503).wrapping_add(11));
+                let fall = 1.0 - (base_t * 0.25 * (0.5 + h) + h * 7.7).fract();
+                let present = hash01(col.wrapping_add(5)) < 0.15 + m.stutter_intensity * 0.5;
+                let k = if present { gauss(y - fall, 0.03) } else { 0.0 };
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.05 + h * 0.3, intensity: k, ..Default::default() }
+            }
+            MotionShape::FireflyGlow => {
+                let col = (x * 80.0) as u32;
+                let h = hash01(col.wrapping_mul(31).wrapping_add(5));
+                let rate = 0.35 + hash01(col.wrapping_add(99)) * 0.5;
+                let s = (base_t * rate + h).fract();
+                let p = (s * TAU).sin() * 0.5 + 0.5;
+                let k = p.powf(5.0);
+                let k = if hard { (k > 0.35) as u8 as f32 } else { k };
+                MotionSample { phase_a: h + base_t * 0.05, intensity: k, ..Default::default() }
+            }
+            MotionShape::DiscoBall => {
+                let dx = x - 0.5;
+                let dy = y - 0.5;
+                let ang = dy.atan2(dx) / TAU + 0.5;
+                let r = (dx * dx + dy * dy).sqrt() * 2.0;
+                let s = (ang * 8.0 - base_t).rem_euclid(1.0);
+                let beam = gauss(s - 0.5, 0.14);
+                let k = (beam * (1.0 - r * 0.35).clamp(0.2, 1.0)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.35) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.2 + ang * 0.5, intensity: k, ..Default::default() }
+            }
+            MotionShape::Searchlight => {
+                let sweep = (base_t * TAU * 0.5).sin() * 0.9;
+                let ang = (x - 0.5).atan2(y + 0.15);
+                let w = 0.10 + m.trail_length * 0.5;
+                let k = (1.0 - (ang - sweep).abs() / w).clamp(0.0, 1.0).powf(1.5);
+                let k = if hard { (k > 0.3) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.1 + ang * 0.25, intensity: k, ..Default::default() }
+            }
+            MotionShape::BarberPole => {
+                let s = (x * freq + y * freq * 0.6 - base_t).rem_euclid(1.0);
+                let t = if hard {
+                    (s >= 0.5) as u8 as f32
+                } else {
+                    smoothstep(0.35, 0.5, s) - smoothstep(0.85, 1.0, s)
+                };
+                MotionSample { phase_a: base_t * 0.1, phase_b: base_t * 0.1 + 0.5, blend_t: t, intensity: 1.0 }
+            }
+            MotionShape::Checkerboard => {
+                let cells = (freq * 2.0).round().max(2.0);
+                let cx = (x * cells).floor() as i32;
+                let cy = (y * cells * 0.5).floor() as i32;
+                let parity = ((cx + cy) & 1) as f32;
+                let cyc = base_t.fract();
+                let flip = if hard {
+                    (cyc >= 0.5) as u8 as f32
+                } else {
+                    smoothstep(0.40, 0.50, cyc) - smoothstep(0.90, 1.0, cyc)
+                };
+                let t = parity * (1.0 - flip) + (1.0 - parity) * flip;
+                MotionSample { phase_a: base_t * 0.15, phase_b: base_t * 0.15 + 0.5, blend_t: t, intensity: 1.0 }
+            }
+            MotionShape::BokehLights => {
+                let mut best = 0.0f32;
+                let mut best_i = 0.0f32;
+                for i in 0..5 {
+                    let fi = i as f32;
+                    let cx = 0.5 + 0.5 * (base_t * TAU * (0.10 + 0.07 * fi) + fi * 1.7).sin();
+                    let cy = 0.5 + 0.5 * (base_t * TAU * (0.08 + 0.05 * fi) + fi * 2.3).cos();
+                    let g = gauss(((x - cx).powi(2) + (y - cy).powi(2)).sqrt(), 0.16);
+                    if g > best { best = g; best_i = fi; }
+                }
+                let k = if hard { (best > 0.45) as u8 as f32 } else { best };
+                MotionSample { phase_a: best_i / 5.0 + base_t * 0.05, intensity: k, ..Default::default() }
+            }
+            MotionShape::DoubleHelix => {
+                let s = (x * freq * TAU + base_t * TAU).sin();
+                let a = 0.5 + 0.3 * s;
+                let b = 0.5 - 0.3 * s;
+                let ka = gauss(y - a, 0.07);
+                let kb = gauss(y - b, 0.07);
+                let k = ka.max(kb);
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample {
+                    phase_a: base_t * 0.1,
+                    phase_b: base_t * 0.1 + 0.5,
+                    blend_t: if kb > ka { 1.0 } else { 0.0 },
+                    intensity: k,
+                }
+            }
+            MotionShape::Pendulum => {
+                let head = 0.5 + 0.45 * (base_t * TAU * 0.5).sin();
+                let k = gauss(x - head, 0.04 + m.trail_length * 0.4);
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.1 + head * 0.3, intensity: k, ..Default::default() }
+            }
+            MotionShape::TwinComets => {
+                let h1 = tri01(base_t * 0.5);
+                let h2 = 1.0 - h1;
+                let tail = m.trail_length.max(0.02);
+                let k1 = (1.0 - (x - h1).abs() / tail).clamp(0.0, 1.0);
+                let k2 = (1.0 - (x - h2).abs() / tail).clamp(0.0, 1.0);
+                let k = k1.max(k2);
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample {
+                    phase_a: base_t * 0.1,
+                    phase_b: base_t * 0.1 + 0.5,
+                    blend_t: if k2 > k1 { 1.0 } else { 0.0 },
+                    intensity: k,
+                }
+            }
+            MotionShape::EqualizerBounce => {
+                let col = (x * 32.0) as u32;
+                let h = hash01(col.wrapping_add(17));
+                let lvl = 0.5 + 0.5 * (base_t * TAU * (0.4 + h * 0.9) + h * TAU).sin();
+                let k = if hard {
+                    ((y * 12.0).floor() / 12.0 <= lvl) as u8 as f32
+                } else {
+                    1.0 - smoothstep(lvl - 0.02, lvl + 0.02, y)
+                };
+                MotionSample { phase_a: y * 0.8, intensity: k, ..Default::default() }
+            }
+            MotionShape::Stairs => {
+                let steps = (freq * 2.0).round().max(2.0);
+                let q = (x * steps).floor() / steps;
+                MotionSample { phase_a: q + base_t * 0.5, intensity: 1.0, ..Default::default() }
+            }
+            MotionShape::TheaterChase => {
+                let idx = (x * 48.0).floor() as i32;
+                let step = (base_t * 6.0).floor() as i32;
+                let lit = (idx + step).rem_euclid(3) == 0;
+                let k = if lit { 1.0 } else if hard { 0.0 } else { 0.06 };
+                MotionSample { phase_a: base_t * 0.1 + x * 0.3, intensity: k, ..Default::default() }
+            }
+            MotionShape::Glitch => {
+                let slot = (base_t * 8.0).floor() as u32;
+                let chunk = (x * 14.0).floor() as u32;
+                let id = slot.wrapping_mul(97).wrapping_add(chunk.wrapping_mul(131));
+                let h = hash01(id);
+                let glitch = h < 0.05 + m.stutter_intensity * 0.45;
+                let mut pa = base_t * 0.15;
+                let mut k = 1.0;
+                if glitch {
+                    pa += 0.35 + hash01(id.wrapping_add(1)) * 0.4;
+                    if hash01(id.wrapping_add(2)) < 0.4 { k = 0.15; }
+                }
+                MotionSample { phase_a: pa, intensity: k, ..Default::default() }
+            }
+            MotionShape::DiscoFloor => {
+                let cells = (freq * 3.0).round().max(3.0);
+                let cx = (x * cells).floor() as u32;
+                let cy = (y * cells * 0.6).floor() as u32;
+                let step = (base_t * 2.0).floor() as u32;
+                let h = hash_u32(cx.wrapping_mul(73_856_093) ^ cy.wrapping_mul(19_349_663) ^ step.wrapping_mul(83_492_791));
+                MotionSample { phase_a: (h % 1000) as f32 / 1000.0, intensity: 1.0, ..Default::default() }
+            }
+            MotionShape::Vortex => {
+                let dx = x - 0.5;
+                let dy = y - 0.5;
+                let r = (dx * dx + dy * dy).sqrt() * 2.0;
+                let ang = dy.atan2(dx) / TAU + 0.5;
+                let arms = freq.round().max(1.0);
+                let s = (ang * arms + r * 1.5 - base_t).rem_euclid(1.0);
+                let k = tri01(s).powf(1.5);
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.2 + r * 0.3, intensity: k, ..Default::default() }
+            }
+            MotionShape::Supernova => {
+                let dx = x - 0.5;
+                let dy = y - 0.5;
+                let r = (dx * dx + dy * dy).sqrt() * 2.0;
+                let cyc = base_t * 0.5;
+                let phase = cyc.fract();
+                let d = r - phase * 1.4;
+                let w = 0.06 + m.trail_length * 0.4;
+                let k = if d > 0.0 { gauss(d, 0.03) } else { (1.0 + d / w).clamp(0.0, 1.0).powf(1.5) };
+                let k = (k * (1.0 - phase * 0.7)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.3) as u8 as f32 } else { k };
+                MotionSample { phase_a: cyc.floor() * 0.381_966, intensity: k, ..Default::default() }
+            }
+            MotionShape::NeonSign => {
+                let slot = (base_t * 10.0).floor() as u32;
+                let chunk = (x * 6.0).floor() as u32;
+                let unstable = hash01(chunk.wrapping_add(501)) < 0.35;
+                let h = hash01(chunk.wrapping_mul(7919).wrapping_add(slot / 3));
+                let off = unstable && h < 0.25 + m.stutter_intensity * 0.5;
+                let hum = 0.94 + 0.06 * (base_t * TAU * 20.0).sin();
+                let k = if off { 0.12 } else { hum };
+                MotionSample { phase_a: chunk as f32 * 0.05 + base_t * 0.02, intensity: k, ..Default::default() }
+            }
+            MotionShape::StrobeBurst => {
+                let cyc = base_t * 0.5;
+                let f = cyc.fract();
+                let in_burst = f < 0.28;
+                let k = if !in_burst {
+                    0.0
+                } else if hard {
+                    ((f * 28.0).fract() < 0.5) as u8 as f32
+                } else {
+                    smoothstep(0.3, 0.7, (f * 28.0 * TAU).sin() * 0.5 + 0.5)
+                };
+                MotionSample { phase_a: cyc.floor() * 0.381_966, intensity: k, ..Default::default() }
+            }
+            MotionShape::MirrorPulse => {
+                let d = (x - 0.5).abs() * 2.0;
+                let cyc = base_t * 0.5;
+                let phase = cyc.fract();
+                let delta = d - phase;
+                let w = 0.05 + m.trail_length * 0.4;
+                let k = if delta > 0.0 { gauss(delta, 0.03) } else { (1.0 + delta / w).clamp(0.0, 1.0).powf(1.5) };
+                let k = (k * (1.0 - phase * 0.4)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.3) as u8 as f32 } else { k };
+                MotionSample { phase_a: cyc.floor() * 0.381_966, intensity: k, ..Default::default() }
+            }
+            MotionShape::DominoFall => {
+                let cyc = base_t * 0.5;
+                let head = cyc.fract() * 1.1;
+                let t = 1.0 - wipe_blend(x, head, m.wipe_softness, hard);
+                let n0 = cyc.floor();
+                MotionSample {
+                    phase_a: n0 * 0.381_966,
+                    phase_b: (n0 + 1.0) * 0.381_966,
+                    blend_t: t,
+                    intensity: 1.0,
+                }
+            }
+            MotionShape::CandleFlicker => {
+                let n1 = value_noise(base_t * 9.0 + x * 6.0);
+                let n2 = value_noise(base_t * 21.0 + x * 13.0 + 40.0);
+                let flick = n1 * 0.65 + n2 * 0.35;
+                let amp = 0.2 + m.stutter_intensity * 0.8;
+                let k = (1.0 - amp * (1.0 - flick)).clamp(0.0, 1.0);
+                MotionSample { phase_a: base_t * 0.03 + flick * 0.08, intensity: k, ..Default::default() }
+            }
+            MotionShape::RadarSweep => {
+                let dx = x - 0.5;
+                let dy = y - 0.5;
+                let ang = dy.atan2(dx) / TAU + 0.5;
+                let r = (dx * dx + dy * dy).sqrt() * 2.0;
+                let sweep = (base_t * 0.5).fract();
+                let behind = (sweep - ang).rem_euclid(1.0);
+                let tail = 0.15 + m.trail_length * 0.8;
+                let k = if behind < tail { (1.0 - behind / tail).powi(2) } else { 0.0 };
+                let k = (k * (1.0 - r * 0.25).clamp(0.3, 1.0)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.25) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.05, intensity: k, ..Default::default() }
+            }
+            MotionShape::Waterfall => {
+                let col = (x * 64.0) as u32;
+                let h = hash01(col.wrapping_mul(2_246_822_519u32 >> 4).wrapping_add(9));
+                let s = y * freq * 1.5 + base_t * (0.6 + h * 0.8) + h * 3.0;
+                let k = 0.35 + 0.65 * tri01(s);
+                let k = if hard { (k > 0.6) as u8 as f32 } else { k };
+                MotionSample { phase_a: base_t * 0.1 + h * 0.15 + y * 0.25, intensity: k, ..Default::default() }
             }
         }
     }
@@ -2091,9 +2513,7 @@ impl VisualizerApp {
                     )
                 } else if is_animated_vertical {
                     let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
-                    let x_norm = ((peak_pos.x - gradient_rect.left())
-                        / gradient_rect.width().max(1.0))
-                    .clamp(0.0, 1.0);
+                    let x_norm = perp_norm(dir, peak_pos, gradient_rect);
                     self.fx_color(self.apply_vis(self.sample_color_changing(x_norm, 1.0, time)), i)
                 } else {
                     let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
@@ -2196,9 +2616,7 @@ impl VisualizerApp {
                         ))
                     } else {
                         let mid = seg_rect.center();
-                        let x_norm = ((mid.x - gradient_rect.left())
-                            / gradient_rect.width().max(1.0))
-                        .clamp(0.0, 1.0);
+                        let x_norm = perp_norm(dir, mid, *gradient_rect);
                         self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
                     };
 
@@ -2338,8 +2756,14 @@ impl VisualizerApp {
                 Vec::new()
             };
 
-            let gx0 = gradient_rect.left();
-            let gw = gradient_rect.width().max(1.0);
+            let (gx0, gw) = match dir {
+                VisualizerDirection::Up | VisualizerDirection::Down => {
+                    (gradient_rect.left(), gradient_rect.width().max(1.0))
+                }
+                VisualizerDirection::Left | VisualizerDirection::Right => {
+                    (gradient_rect.top(), gradient_rect.height().max(1.0))
+                }
+            };
 
             for i in 0..bars.len().saturating_sub(1) {
                 let a = &bars[i];
@@ -2373,6 +2797,34 @@ impl VisualizerApp {
                         let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
                         self.mesh.push_quad(p1, p4, p3, p2, color);
                     }
+                }
+            }
+
+            // Edge caps: the fill must reach the outer edge of the first/last bar, which
+            // is where the outline contour is drawn. Without them a half-bar-wide gap
+            // appeared between the fill and the outline in the vertical colour modes.
+            let half = bar_width / 2.0;
+            let last_idx = bars.len() - 1;
+            for (bi, outward) in [(0usize, -1.0f32), (last_idx, 1.0f32)] {
+                let (bar_perp, bar_len) = (bars[bi].perp, bars[bi].len);
+                if bar_len <= MIN_VISIBLE_LEN {
+                    continue;
+                }
+                let p_out = bar_perp + outward * half;
+                let (pa, pb) = if outward < 0.0 { (p_out, bar_perp) } else { (bar_perp, p_out) };
+                let x_norm = if is_static_multi { 0.0 } else { (((pa + pb) * 0.5 - gx0) / gw).clamp(0.0, 1.0) };
+                for (k, &(t_bot, t_top, t_mid)) in seg_tab.iter().enumerate() {
+                    let color = if is_static_multi {
+                        seg_colors[k]
+                    } else {
+                        self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
+                    };
+                    let color = self.fx_color(color, bi);
+                    let p1 = bar_vertex(dir, pa, anchor, bar_len, t_top);
+                    let p2 = bar_vertex(dir, pb, anchor, bar_len, t_top);
+                    let p3 = bar_vertex(dir, pb, anchor, bar_len, t_bot);
+                    let p4 = bar_vertex(dir, pa, anchor, bar_len, t_bot);
+                    self.mesh.push_quad(p1, p4, p3, p2, color);
                 }
             }
         } else {
@@ -2513,7 +2965,7 @@ impl SettingsState {
     fn draw_top_nav(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Settings")
+                egui::RichText::new(format!("{} {}", cfg::APP_NAME, cfg::APP_VERSION))
                     .size(16.0)
                     .strong()
                     .color(accent()),
@@ -2692,6 +3144,11 @@ impl SettingsState {
                 self.config.audio.num_bars = DEFAULT_NUM_BARS
             });
         });
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "How many frequency bands the spectrum is split into. More bars = finer detail but a wider visualizer (and slightly more CPU).",
+        );
         slider_f32(
             ui,
             &mut self.config.max_bar_height,
@@ -2699,12 +3156,22 @@ impl SettingsState {
             "Max Bar Height (0 = full)",
             DEFAULT_MAX_BAR_HEIGHT,
         );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Hard limit for bar height in pixels. 0 = bars may use the full Height Scale.",
+        );
         slider_f32(
             ui,
             &mut self.config.height_scale,
             0.1..=1.0,
             "Height Scale",
             DEFAULT_HEIGHT_SCALE,
+        );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Fraction of the screen the tallest bar may reach (a full-level bar uses this much).",
         );
 
         section_header(ui, "Position");
@@ -2721,6 +3188,11 @@ impl SettingsState {
             -1000.0..=1000.0,
             "Vertical Offset",
             DEFAULT_Y_OFFSET,
+        );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Moves the whole visualizer in pixels from its default spot on the screen edge.",
         );
 
         section_header(ui, "Appearance");
@@ -2926,6 +3398,16 @@ impl SettingsState {
                 "Vertical",
             );
         });
+        help_text(
+            ui,
+            self.config.show_help_text,
+            match self.config.static_mode {
+                StaticDistributionMode::Blocks => "Blocks: the bars are split into equal groups, one colour per group.",
+                StaticDistributionMode::Sequential => "Sequential: colours repeat in order, a few bars at a time.",
+                StaticDistributionMode::Random => "Random: every bar gets a fixed random colour from the palette.",
+                StaticDistributionMode::Vertical => "Vertical: colours are stacked along the height of each bar.",
+            },
+        );
         if self.config.static_mode == StaticDistributionMode::Sequential {
             ui.horizontal(|ui| {
                 let mut n = self.config.sequential_bars_per_color as i32;
@@ -2938,6 +3420,11 @@ impl SettingsState {
                     self.config.sequential_bars_per_color = 1
                 });
             });
+            help_text(
+                ui,
+                self.config.show_help_text,
+                "How many neighbouring bars share one colour before the next colour starts.",
+            );
         }
         if self.config.static_mode == StaticDistributionMode::Vertical {
             ui.horizontal(|ui| {
@@ -3115,7 +3602,7 @@ impl SettingsState {
         help_text(
             ui,
             self.config.show_help_text,
-            "0° = horizontal, 90° = vertical, 45° = diagonal.",
+            "0° = along the frequency axis (low to high), 90° = from the base of the bars to their tips, 45° = diagonal. The angle follows the visualizer direction, so presets look the same facing up, down, left or right.",
         );
         if is_dynamic {
             if let GradientSource::Dynamic {
@@ -3454,6 +3941,11 @@ impl SettingsState {
             "Speed",
             0.5,
         );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Base speed of the colour animation. Motion Speed below multiplies it.",
+        );
 
         section_header(ui, "Motion Shape");
         combo_reset(
@@ -3465,6 +3957,11 @@ impl SettingsState {
             180.0,
             &MotionShape::all(),
             MotionShape::display_name,
+        );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            self.config.color_change_motion.shape.description(),
         );
         if self.config.color_change_motion.shape.uses_vertical_axis() {
             ui.horizontal(|ui| {
@@ -3514,17 +4011,16 @@ impl SettingsState {
             "Motion Speed",
             1.0,
         );
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Multiplies the animation speed of the selected shape (0 freezes it).",
+        );
 
         let shape = self.config.color_change_motion.shape;
         let hard = self.config.color_change_motion.blend == BlendMode::Hard;
-        if matches!(
-            shape,
-            MotionShape::SineWave
-                | MotionShape::TriangleWave
-                | MotionShape::SquareWave
-                | MotionShape::SawtoothWave
-                | MotionShape::WaveInterference
-        ) {
+        let sh = self.config.show_help_text;
+        if shape.uses_wave_frequency() {
             slider_f32(
                 ui,
                 &mut self.config.color_change_motion.wave_frequency,
@@ -3532,11 +4028,9 @@ impl SettingsState {
                 "Wave Frequency",
                 2.0,
             );
+            help_text(ui, sh, "How many waves / stripes / cells fit across the visualizer.");
         }
-        if matches!(
-            shape,
-            MotionShape::Comet | MotionShape::BouncingBall | MotionShape::Sinelon
-        ) {
+        if shape.uses_trail_length() {
             slider_f32(
                 ui,
                 &mut self.config.color_change_motion.trail_length,
@@ -3544,11 +4038,9 @@ impl SettingsState {
                 "Trail Length",
                 0.25,
             );
+            help_text(ui, sh, "Length of the glow, tail or beam of the moving element.");
         }
-        if matches!(
-            shape,
-            MotionShape::Stutter | MotionShape::Sparkle | MotionShape::Confetti
-        ) {
+        if shape.uses_event_intensity() {
             slider_f32(
                 ui,
                 &mut self.config.color_change_motion.stutter_intensity,
@@ -3556,15 +4048,9 @@ impl SettingsState {
                 "Event Intensity",
                 0.3,
             );
+            help_text(ui, sh, "How often random events (glitches, flashes, drops) happen.");
         }
-        if matches!(
-            shape,
-            MotionShape::HorizontalWipe
-                | MotionShape::VerticalWipe
-                | MotionShape::DiagonalWipe
-                | MotionShape::RadialWipe
-        ) && !hard
-        {
+        if shape.uses_wipe_softness() && !hard {
             slider_f32(
                 ui,
                 &mut self.config.color_change_motion.wipe_softness,
@@ -3572,6 +4058,7 @@ impl SettingsState {
                 "Wipe Softness",
                 0.1,
             );
+            help_text(ui, sh, "Width of the soft edge between the two colours.");
         }
         if shape.uses_intensity() {
             color_edit_reset(
@@ -3717,6 +4204,12 @@ impl SettingsState {
             });
         });
 
+        help_text(
+            ui,
+            show_help,
+            "Lowest / highest frequency shown. Raise Min Frequency to ignore rumble; lower Max Frequency to ignore hiss.",
+        );
+
         section_header(ui, "Amplitude");
         slider_f32(ui, &mut a.sensitivity, 0.0..=100.0, "Sensitivity", DEFAULT_SENSITIVITY);
         help_text(
@@ -3772,6 +4265,11 @@ impl SettingsState {
                 a.max_decibels = DEFAULT_MAX_DB
             });
         });
+        help_text(
+            ui,
+            show_help,
+            "Level range mapped onto the bar height: signals at Min dB give an empty bar, signals at Max dB a full one. Lower Max dB = taller bars.",
+        );
         if a.min_decibels >= a.max_decibels {
             ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
         }
@@ -3814,12 +4312,18 @@ impl SettingsState {
         if a.agc_enabled {
             slider_f32(ui, &mut a.agc_attack, 0.01..=0.9, "AGC Attack", DEFAULT_AGC_ATTACK);
             slider_f32(ui, &mut a.agc_release, 0.0001..=0.05, "AGC Release", DEFAULT_AGC_RELEASE);
+            help_text(
+                ui,
+                show_help,
+                "Attack = how fast the gain drops when music gets loud. Release = how slowly it rises again when music gets quiet.",
+            );
         }
 
         section_header(ui, "Frequency Shaping");
         slider_f32(ui, &mut a.eq_bass_db, -10.0..=10.0, "Bass EQ (< 250 Hz)", DEFAULT_EQ_BASS);
         slider_f32(ui, &mut a.eq_mid_db, -10.0..=10.0, "Mid EQ (250–4k Hz)", DEFAULT_EQ_MID);
         slider_f32(ui, &mut a.eq_treble_db, -10.0..=10.0, "Treble EQ (> 4k Hz)", DEFAULT_EQ_TREBLE);
+        help_text(ui, show_help, "Boost or cut a frequency region (in dB) before it is drawn. Smoothly blended between regions.");
         slider_f32(
             ui,
             &mut a.spectrum_tilt,
@@ -3835,6 +4339,11 @@ impl SettingsState {
 
         section_header(ui, "Timing");
         slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
+        help_text(
+            ui,
+            show_help,
+            "How many times per second the audio is analysed. Higher = more responsive but uses more CPU.",
+        );
 
         ui.horizontal(|ui| {
             let mut n = a.average_size as i32;
@@ -3847,6 +4356,11 @@ impl SettingsState {
                 a.average_size = DEFAULT_AVERAGE_SIZE
             });
         });
+        help_text(
+            ui,
+            show_help,
+            "Averages the last N analysis frames (scaled to a 60 Hz poll rate). Higher = calmer bars, but they react later.",
+        );
 
         section_header(ui, "Ballistics");
         if a.decay_mode != self.last_decay_mode {
@@ -3869,6 +4383,11 @@ impl SettingsState {
 
         slider_f32(ui, &mut a.attack_time_ms, 0.0..=100.0, "Attack Time (ms)", DEFAULT_ATTACK_MS);
         slider_f32(ui, &mut a.decay_time_ms, 50.0..=2000.0, "Decay Time (ms)", DEFAULT_DECAY_MS);
+        help_text(
+            ui,
+            show_help,
+            "Attack = how fast bars rise (0 = instantly). Decay = how long bars take to fall back down.",
+        );
         ui.horizontal(|ui| {
             ui.label("Peak Hold (ms):");
             let r = ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0));
@@ -3879,6 +4398,11 @@ impl SettingsState {
                 a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS
             });
         });
+        help_text(
+            ui,
+            show_help,
+            "Keeps a small peak marker at the highest recent level for this long before it falls. 0 = no peak markers.",
+        );
         if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
             slider_f32(
                 ui,
@@ -3886,6 +4410,11 @@ impl SettingsState {
                 0.1..=5.0,
                 "Gravity Coefficient",
                 DEFAULT_GRAVITY_COEFF,
+            );
+            help_text(
+                ui,
+                show_help,
+                "Strength of the falling acceleration (Gravity decay and peak markers). Higher = snappier drop.",
             );
         }
         checkbox_reset(
@@ -3931,6 +4460,11 @@ impl SettingsState {
             "Beat Detection Sensitivity",
             DEFAULT_BEAT_SENS,
         );
+        help_text(
+            ui,
+            show_help,
+            "Higher = more hits are accepted as beats (can add false beats). Lower = only strong hits count.",
+        );
         slider_f32(
             ui,
             &mut a.onset_threshold_multiplier,
@@ -3962,6 +4496,11 @@ impl SettingsState {
             "BPM Lock / Phase Smoothing",
             false,
         );
+        help_text(
+            ui,
+            show_help,
+            "Keeps a steady beat clock running between detected hits and fills in beats the detector missed. Best for tracks with a constant tempo.",
+        );
         if a.bpm_lock_enabled {
             slider_f32(
                 ui,
@@ -3969,6 +4508,11 @@ impl SettingsState {
                 0.0..=1.0,
                 "Phase Smoothing",
                 DEFAULT_BPM_PHASE_SMOOTHING,
+            );
+            help_text(
+                ui,
+                show_help,
+                "How strongly the beat clock is pulled onto detected hits. Higher = follows the music faster, lower = steadier.",
             );
         }
 
@@ -4143,6 +4687,7 @@ impl SettingsState {
     fn tab_track_info(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
         let system_fonts = &self.system_fonts;
+        let sh = self.config.show_help_text;
         let cfg = &mut self.config.track_info;
 
         section_header(ui, "Cover Art");
@@ -4285,10 +4830,16 @@ impl SettingsState {
                 "Visualizer Color",
             );
         });
+        help_text(
+            ui,
+            sh,
+            "Static = one fixed colour. Visualizer Color = the text takes the colour of the visualizer (follows the Colors tab, including animations).",
+        );
         if cfg.color_mode == TrackTextColorMode::Static {
             color_edit_reset(ui, &mut cfg.static_color, "Color", [220, 220, 220]);
         }
         slider_u8(ui, &mut cfg.opacity, "Text Opacity", 255);
+        help_text(ui, sh, "Pick an installed font above, or type the full path of a .ttf / .otf file in 'Custom path'.");
 
         ui.add_space(8.0);
         ui.label(
@@ -4369,6 +4920,7 @@ impl SettingsState {
                 .color(egui::Color32::from_gray(180)),
         );
         checkbox_reset(ui, &mut cfg.shadow_enabled, "Enable Shadow", true);
+        help_text(ui, sh, "A soft drop shadow behind the text keeps it readable on bright wallpapers. Blur = 0 gives a hard shadow.");
         if cfg.shadow_enabled {
             slider_f32(ui, &mut cfg.shadow_offset_x, -30.0..=30.0, "Shadow X Offset", 2.0);
             slider_f32(ui, &mut cfg.shadow_offset_y, -30.0..=30.0, "Shadow Y Offset", 2.0);
@@ -4383,6 +4935,7 @@ impl SettingsState {
                 .color(egui::Color32::from_gray(180)),
         );
         checkbox_reset(ui, &mut cfg.outline_enabled, "Enable Outline", false);
+        help_text(ui, sh, "Draws a thin contour around every letter.");
         if cfg.outline_enabled {
             slider_f32(ui, &mut cfg.outline_thickness, 0.1..=6.0, "Outline Thickness", 1.0);
             color_edit_reset(ui, &mut cfg.outline_color, "Outline Color", [0, 0, 0]);
@@ -4422,12 +4975,14 @@ impl SettingsState {
             });
         });
 
+        help_text(ui, self.config.show_help_text, "Size of this settings window. Right-click any slider or checkbox to reset it to its default.");
         checkbox_reset(
             ui,
             &mut self.config.open_settings_on_launch,
             "Open Settings on Launch",
             DEFAULT_OPEN_SETTINGS_ON_LAUNCH,
         );
+        help_text(ui, self.config.show_help_text, "Opens this window every time the app starts. Toggle it any time with Ctrl+Shift+V or from the tray icon.");
         checkbox_reset(
             ui,
             &mut self.config.show_help_text,
@@ -4448,6 +5003,32 @@ impl SettingsState {
             ui,
             self.config.show_help_text,
             "Live capture/analysis stats, sample rate, dropped frames, BPM, onsets.",
+        );
+
+        section_header(ui, "Performance");
+        ui.horizontal(|ui| {
+            ui.label("Frame Rate Cap:");
+            let label = if self.config.fps_cap == 0 {
+                "Monitor refresh".to_string()
+            } else {
+                format!("{} fps", self.config.fps_cap)
+            };
+            egui::ComboBox::from_id_source("fps_cap")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for v in [30u32, 45, 60, 90, 120, 144, 0] {
+                        let name = if v == 0 { "Monitor refresh".to_string() } else { format!("{v} fps") };
+                        ui.selectable_value(&mut self.config.fps_cap, v, name);
+                    }
+                });
+            reset_btn(ui, self.config.fps_cap != DEFAULT_FPS_CAP, || {
+                self.config.fps_cap = DEFAULT_FPS_CAP
+            });
+        });
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Limits how often the overlay is redrawn. 60 fps looks smooth and cuts GPU / Desktop Window Manager load a lot on 120-240 Hz monitors. Choose 'Monitor refresh' for the old behaviour.",
         );
     }
 
@@ -4608,7 +5189,7 @@ impl VisualizerApp {
             .rounding(8.0)
             .inner_margin(egui::Margin::symmetric(12.0, 10.0));
 
-        let mut win = egui::Window::new("Rust Visualizer — Settings")
+        let mut win = egui::Window::new(format!("{} {} — Settings", cfg::APP_NAME, cfg::APP_VERSION))
             .id(egui::Id::new(("settings_window", scale_key)))
             .title_bar(false)
             .frame(frame)
@@ -4767,7 +5348,12 @@ impl VisualizerApp {
             || self.last_rms > 0.001
             || (self.last_beat_in > 0.0 && self.last_beat_in < 0.5);
         if has_audio {
-            ctx.request_repaint();
+            let iv = Self::fps_interval_us(self.config.fps_cap);
+            if iv == 0 {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(Duration::from_micros(iv));
+            }
             return;
         }
 
@@ -4796,6 +5382,7 @@ impl eframe::App for VisualizerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
+        self.wake_last_us.store(self.wake_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
         if dt > 0.0 && dt < 0.1 {
@@ -4830,6 +5417,8 @@ impl eframe::App for VisualizerApp {
             self.seen_gen = generation;
             let mut st = lock_state(&self.shared);
             self.config = st.config.clone();
+            self.wake_interval_us
+                .store(Self::fps_interval_us(self.config.fps_cap), Ordering::Relaxed);
             match st.fx_reset {
                 1 => self.fx.dynamics.reset_track(),
                 2 => self.fx.dynamics.reset_all(),
@@ -5046,7 +5635,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Rust Visualizer",
+        cfg::APP_NAME,
         options,
         Box::new(|cc| Box::new(VisualizerApp::new(cc.egui_ctx.clone()))),
     )
