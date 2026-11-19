@@ -62,8 +62,6 @@ pub const DEFAULT_PER_BAND_BALLISTICS:     bool  = false;
 pub const DEFAULT_PER_FRAME_NORMALIZATION: bool  = false;
 pub const DEFAULT_BEAT_ENVELOPE_DECAY_MS:  f32   = 120.0;
 pub const DEFAULT_PEAK_BLOOM:              bool  = false;
-/// Render frame-rate cap in fps (0 = follow the monitor refresh rate).
-pub const DEFAULT_FPS_CAP:                 u32   = 60;
 
 // ─────────────────────────────────────────────────────────────
 // Visualizer primitives
@@ -2354,7 +2352,6 @@ pub struct AppConfig {
     #[serde(default = "default_open_settings_on_launch")] pub open_settings_on_launch: bool,
     #[serde(default = "default_show_help_text")] pub show_help_text: bool,
     #[serde(default)] pub show_diagnostics: bool,
-    #[serde(default = "default_fps_cap")] pub fps_cap: u32,
 
     // Outlines
     #[serde(default, alias = "bar_outline_enabled")]   pub visualizer_outline_enabled: bool,
@@ -2412,7 +2409,6 @@ fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
 fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
 fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
 fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
-fn default_fps_cap() -> u32 { DEFAULT_FPS_CAP }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -2428,7 +2424,6 @@ impl Default for AppConfig {
             open_settings_on_launch: DEFAULT_OPEN_SETTINGS_ON_LAUNCH,
             show_help_text: DEFAULT_SHOW_HELP_TEXT,
             show_diagnostics: false,
-            fps_cap: DEFAULT_FPS_CAP,
             visualizer_outline_enabled: false,
             visualizer_outline_thickness: default_visualizer_outline_thickness(),
             visualizer_outline_color: default_visualizer_outline_color(),
