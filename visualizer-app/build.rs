@@ -4,7 +4,7 @@ fn main() {
         // Make sure the path is correct relative to this build.rs file
         res.set_icon("../assets/icon.ico"); 
         res.set("ProductName", "SABI NEIRO");
-        res.set("FileDescription", "Desktop Music Visualizer");
+        res.set("FileDescription", "SABI NEIRO");
         res.compile().unwrap();
     }
 }
