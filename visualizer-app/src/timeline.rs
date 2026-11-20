@@ -131,7 +131,7 @@ impl Timeline {
         } else if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() { if p.y < wave_r.bottom() + 2.0 { out.seek = Some(t_of(p.x).clamp(0.0, dur)); } }
         }
-        if resp.drag_released() || (!resp.dragged() && !resp.drag_started()) { self.drag = Drag::None; }
+        if resp.drag_stopped() || (!resp.dragged() && !resp.drag_started()) { self.drag = Drag::None; }
 
         // ── drawing ──
         painter.rect_filled(rect, 4.0, egui::Color32::from_gray(22));
@@ -141,7 +141,7 @@ impl Timeline {
         while t <= t0 + len {
             let x = x_of(t);
             if x >= rect.left() {
-                painter.line_segment([egui::pos2(x, rect.top() + RULER_H - 5.0), egui::pos2(x, rect.top() + RULER_H)], egui::Stroke::new(1.0, egui::Color32::GRAY));
+                painter.line_segment([egui::pos2(x, rect.top() + RULER_H - 5.0), egui::pos2(x, rect.top() + RULER_H)], egui::Stroke::new(1.0_f32, egui::Color32::GRAY));
                 painter.text(egui::pos2(x + 3.0, rect.top() + 1.0), egui::Align2::LEFT_TOP, fmt_t(t), egui::FontId::monospace(10.0), egui::Color32::GRAY);
             }
             t += step;
@@ -154,7 +154,7 @@ impl Timeline {
                 let col = egui::Color32::from_rgb(110, 170, 255);
                 for (i, (mn, mx)) in wf.peaks(t0, t0 + len, n).iter().enumerate() {
                     let x = rect.left() + i as f32 + 0.5;
-                    painter.line_segment([egui::pos2(x, mid - mx * h), egui::pos2(x, mid - mn * h)], egui::Stroke::new(1.0, col));
+                    painter.line_segment([egui::pos2(x, mid - mx * h), egui::pos2(x, mid - mn * h)], egui::Stroke::new(1.0_f32, col));
                 }
             }
             None => { painter.text(wave_r.center(), egui::Align2::CENTER_CENTER, "Add an audio file (Ctrl+I)", egui::FontId::proportional(13.0), egui::Color32::GRAY); }
@@ -169,7 +169,7 @@ impl Timeline {
             let orange = egui::Color32::from_rgb(255, 160, 40);
             for (x, label) in [(x_of(a as f32), "IN"), (x_of(b as f32), "OUT")] {
                 if x >= rect.left() - 1.0 && x <= rect.right() + 1.0 {
-                    painter.line_segment([egui::pos2(x, wave_r.top()), egui::pos2(x, wave_r.bottom())], egui::Stroke::new(2.0, orange));
+                    painter.line_segment([egui::pos2(x, wave_r.top()), egui::pos2(x, wave_r.bottom())], egui::Stroke::new(2.0_f32, orange));
                     painter.text(egui::pos2(x + 3.0, wave_r.bottom() - 2.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::monospace(10.0), orange);
                 }
             }
@@ -184,19 +184,19 @@ impl Timeline {
             let a = if l.visible { 200 } else { 70 };
             let bar = egui::Rect::from_min_max(egui::pos2(xs, y + 1.0), egui::pos2(xe, y + ROW_H - 1.0));
             painter.rect_filled(bar, 3.0, egui::Color32::from_rgba_unmultiplied(base.0, base.1, base.2, a));
-            if *inp.selected == Some(l.id) { painter.rect_stroke(bar, 3.0, egui::Stroke::new(1.5, egui::Color32::WHITE)); }
+            if *inp.selected == Some(l.id) { painter.rect_stroke(bar, 3.0, egui::Stroke::new(1.5_f32, egui::Color32::WHITE)); }
             painter.with_clip_rect(bar).text(bar.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER, &l.name, egui::FontId::proportional(10.0), egui::Color32::BLACK);
         }
         // hover + playhead
         if let Some(h) = resp.hover_pos() {
             if rect.contains(h) {
-                painter.line_segment([egui::pos2(h.x, wave_r.top()), egui::pos2(h.x, wave_r.bottom())], egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)));
+                painter.line_segment([egui::pos2(h.x, wave_r.top()), egui::pos2(h.x, wave_r.bottom())], egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(70)));
                 painter.text(egui::pos2(h.x + 4.0, wave_r.top() + 2.0), egui::Align2::LEFT_TOP, fmt_t(t_of(h.x)), egui::FontId::monospace(11.0), egui::Color32::WHITE);
             }
         }
         let px = x_of(inp.pos);
         if px >= rect.left() && px <= rect.right() {
-            painter.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())], egui::Stroke::new(2.0, egui::Color32::WHITE));
+            painter.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())], egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
         }
         out
     }

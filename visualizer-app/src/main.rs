@@ -13,6 +13,8 @@ mod studio;
 mod timeline;
 mod video;
 
+use crate::render::Host; // brings `draw_scene` into scope
+
 use eframe::egui;
 use image::DynamicImage;
 use std::f32::consts::TAU;
@@ -5451,11 +5453,11 @@ fn draw_checkerboard(p: &egui::Painter, r: egui::Rect) {
 }
 
 fn draw_guides(p: &egui::Painter, r: egui::Rect, aspect: f32) {
-    let title_safe = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 255, 255, 140));
-    let action_safe = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140));
+    let title_safe = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 255, 255, 140));
+    let action_safe = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140));
     p.rect_stroke(egui::Rect::from_center_size(r.center(), r.size() * 0.95), 0.0, action_safe);
     p.rect_stroke(egui::Rect::from_center_size(r.center(), r.size() * 0.90), 0.0, title_safe);
-    let thin = egui::Stroke::new(0.5, title_safe.color);
+    let thin = egui::Stroke::new(0.5_f32, title_safe.color);
     p.line_segment([egui::pos2(r.center().x, r.top()), egui::pos2(r.center().x, r.bottom())], thin);
     p.line_segment([egui::pos2(r.left(), r.center().y), egui::pos2(r.right(), r.center().y)], thin);
     if aspect < 0.7 {
@@ -5675,9 +5677,18 @@ impl render::Host for VisualizerApp {
         let res = off.render(params, |c, rect, painter, cover_tex| {
             if saved_cover.is_some() { self.cover_texture = cover_tex; }
             if let Some(b) = bg { painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(b[0], b[1], b[2])); }
-            comp.draw_layers(c, painter, rect, layers, t, track_len, project_dir, &mut |p| {
+            comp.draw_layers(c, painter, rect, layers, t, track_len, project_dir, &mut |p, alpha| {
+                // Layer opacity/fades: scale the three opacity settings for this call only.
+                let keep = (self.config.visualizer_opacity, self.config.track_info.opacity, self.config.track_info.cover_opacity);
+                if alpha < 0.999 {
+                    let sc = |v: u8| (v as f32 * alpha).round().clamp(0.0, 255.0) as u8;
+                    self.config.visualizer_opacity = sc(keep.0);
+                    self.config.track_info.opacity = sc(keep.1);
+                    self.config.track_info.cover_opacity = sc(keep.2);
+                }
                 self.draw_bars(p, c, rect, egui::Pos2::ZERO);
                 self.draw_track_info(p, c, egui::Pos2::ZERO, rect);
+                (self.config.visualizer_opacity, self.config.track_info.opacity, self.config.track_info.cover_opacity) = keep;
             });
         });
 

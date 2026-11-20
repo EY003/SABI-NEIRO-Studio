@@ -37,14 +37,6 @@ pub fn font_family_name(path: &str) -> String {
     format!("tl_{:x}", h.finish())
 }
 
-/// NOTE: `Painter::multiply_opacity` needs egui >= 0.27. If your version lacks it, make this
-/// return `painter.clone()`; layer opacity/fades then do not apply to the visualizer layer.
-fn with_opacity(painter: &egui::Painter, a: f32) -> egui::Painter {
-    let mut p = painter.clone();
-    if a < 0.999 { p.multiply_opacity(a); }
-    p
-}
-
 fn alpha_u8(a: f32) -> u8 { (a.clamp(0.0, 1.0) * 255.0).round() as u8 }
 
 // ── video layer state ────────────────────────────────────────
@@ -202,7 +194,8 @@ impl Compositor {
         self.images.get(&path).and_then(|e| e.as_ref()).map(|e| (e.tex.id(), e.size))
     }
 
-    /// Draw every layer, bottom to top. `visualizer` draws bars + track info at the given alpha.
+    /// Draw every layer, bottom to top. `visualizer(painter, alpha)` draws bars + track info; the app
+    /// applies `alpha` by scaling its own opacity settings (egui 0.27 has no per-painter opacity).
     pub fn draw_layers(
         &mut self,
         c: &egui::Context,
@@ -212,7 +205,7 @@ impl Compositor {
         t: f64,
         track_len: f64,
         dir: &Path,
-        visualizer: &mut dyn FnMut(&egui::Painter),
+        visualizer: &mut dyn FnMut(&egui::Painter, f32),
     ) {
         let clipped = painter.with_clip_rect(canvas);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -221,7 +214,7 @@ impl Compositor {
             if a <= 0.0 { continue; }
             let tint = egui::Color32::from_white_alpha(alpha_u8(a));
             match &l.kind {
-                LayerKind::Visualizer => visualizer(&with_opacity(painter, a)),
+                LayerKind::Visualizer => visualizer(painter, a),
                 LayerKind::Image { media, fit, offset } => {
                     if let Some((id, size)) = self.image_tex(c, media, dir) {
                         clipped.image(id, fit_rect(size, canvas, *fit, *offset), uv, tint);
