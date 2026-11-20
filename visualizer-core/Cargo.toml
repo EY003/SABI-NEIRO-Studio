@@ -18,6 +18,7 @@ toml = "0.8"
 arc-swap = "1.7"
 spin_sleep = "1.2"
 symphonia = { version = "0.5", features = ["all"] }
+cpal = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
