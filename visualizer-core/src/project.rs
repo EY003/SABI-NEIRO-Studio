@@ -1,23 +1,28 @@
 //! Project document: everything that is saved to a project file and that undo/redo covers.
 //! Layer order: index 0 is the BOTTOM layer.
-//! Requires `PartialEq` on `AppConfig` (see PATCHES.md).
+//! `ProjectDoc` is Clone-only on purpose (AppConfig has no PartialEq); change detection is done by
+//! the caller (config fingerprint) and recorded with `UndoStack::push`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::AppConfig;
+use crate::export::RenderSettings;
 
 pub const PROJECT_VERSION: u32 = 1;
 
 // ── Media references (relinking / portability) ───────────────
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// Equality is by path only: `rel`/`size` are bookkeeping and must not count as an edit.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MediaRef {
     pub path: PathBuf,
     /// Path relative to the project file, when the media lives under it.
     #[serde(default)] pub rel: Option<PathBuf>,
     #[serde(default)] pub size: u64,
 }
+
+impl PartialEq for MediaRef { fn eq(&self, o: &Self) -> bool { self.path == o.path } }
 
 impl MediaRef {
     pub fn new(path: &Path, project_dir: Option<&Path>) -> Self {
@@ -53,19 +58,6 @@ impl MediaRef {
 }
 
 // ── Canvas / layers ──────────────────────────────────────────
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Canvas {
-    pub width: u32,
-    pub height: u32,
-    pub fps: f32,
-    /// Opaque fill colour used when the export is not transparent.
-    pub background: [u8; 3],
-    pub transparent: bool,
-}
-impl Default for Canvas {
-    fn default() -> Self { Self { width: 1920, height: 1080, fps: 60.0, background: [0, 0, 0], transparent: false } }
-}
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FitMode { #[default] Cover, Contain, Stretch }
@@ -140,11 +132,11 @@ pub struct AudioItem {
     #[serde(default)] pub range: Option<(f64, f64)>,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProjectDoc {
     pub version: u32,
     pub name: String,
-    pub canvas: Canvas,
+    pub render: RenderSettings,
     pub config: AppConfig,
     pub layers: Vec<Layer>,
     pub audio: Vec<AudioItem>,
@@ -156,7 +148,7 @@ impl Default for ProjectDoc {
         Self {
             version: PROJECT_VERSION,
             name: "Untitled".into(),
-            canvas: Canvas::default(),
+            render: RenderSettings::default(),
             config: AppConfig::default(),
             layers: vec![Layer::new(1, "Visualizer", LayerKind::Visualizer)],
             audio: vec![],
@@ -187,6 +179,38 @@ impl ProjectDoc {
         Ok(doc)
     }
 
+    /// Every media reference in the project (audio, image and video layers).
+    pub fn media_refs_mut(&mut self) -> Vec<&mut MediaRef> {
+        let mut v: Vec<&mut MediaRef> = Vec::new();
+        for a in self.audio.iter_mut() { v.push(&mut a.media); }
+        for l in self.layers.iter_mut() {
+            match &mut l.kind {
+                LayerKind::Image { media, .. } | LayerKind::Video { media, .. } => v.push(media),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    /// Recompute relative paths for a (new) project location.
+    pub fn refresh_rel(&mut self, dir: &Path) {
+        for m in self.media_refs_mut() { m.rel = m.path.strip_prefix(dir).ok().map(|p| p.to_path_buf()); }
+    }
+
+    /// Point every reference to `old` at `new` (relinking). Returns how many were changed.
+    pub fn relink(&mut self, old: &Path, new: &Path) -> usize {
+        let mut n = 0;
+        for m in self.media_refs_mut() {
+            if m.path == old { m.path = new.to_path_buf(); m.size = std::fs::metadata(new).map(|x| x.len()).unwrap_or(0); n += 1; }
+        }
+        n
+    }
+
+    /// Replace each reference's path with its resolved location when one is found.
+    pub fn resolve_all(&mut self, dir: &Path) {
+        for m in self.media_refs_mut() { if let Some(p) = m.resolve(dir) { m.path = p; } }
+    }
+
     /// Every media file that can no longer be found.
     pub fn missing_media(&self, project_dir: &Path) -> Vec<PathBuf> {
         let mut out = vec![];
@@ -207,24 +231,24 @@ impl ProjectDoc {
 
 // ── Undo / redo (snapshot based, edit coalescing by explicit commit) ──
 
-pub struct UndoStack<T: Clone + PartialEq> {
+pub struct UndoStack<T: Clone> {
     baseline: T,
     past: Vec<T>,
     future: Vec<T>,
     limit: usize,
 }
 
-impl<T: Clone + PartialEq> UndoStack<T> {
+impl<T: Clone> UndoStack<T> {
     pub fn new(initial: T) -> Self { Self { baseline: initial, past: vec![], future: vec![], limit: 200 } }
+    /// The last recorded state; compare the live state against it to detect edits.
+    pub fn baseline(&self) -> &T { &self.baseline }
 
-    /// Call when an edit FINISHES (button click, slider released, text field lost focus),
-    /// not on every frame of a drag. Returns true if a step was recorded.
-    pub fn commit(&mut self, current: &T) -> bool {
-        if *current == self.baseline { return false; }
+    /// Record `current` as a new step (the caller already knows something changed).
+    /// Call when an edit FINISHES, not on every frame of a drag.
+    pub fn push(&mut self, current: &T) {
         self.past.push(std::mem::replace(&mut self.baseline, current.clone()));
         self.future.clear();
         if self.past.len() > self.limit { self.past.remove(0); }
-        true
     }
     pub fn undo(&mut self) -> Option<T> {
         let prev = self.past.pop()?;
@@ -240,6 +264,54 @@ impl<T: Clone + PartialEq> UndoStack<T> {
     pub fn can_redo(&self) -> bool { !self.future.is_empty() }
     /// After loading a project: forget history.
     pub fn reset(&mut self, initial: T) { *self = Self::new(initial); }
+}
+
+impl<T: Clone + PartialEq> UndoStack<T> {
+    /// `push` only if `current` differs from the baseline.
+    pub fn commit(&mut self, current: &T) -> bool {
+        if *current == self.baseline { return false; }
+        self.push(current);
+        true
+    }
+}
+
+// ── Presets (reusable look: visualizer config + render settings + layers, no audio) ──
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PresetFile {
+    pub version: u32,
+    pub name: String,
+    pub render: RenderSettings,
+    pub config: AppConfig,
+    pub layers: Vec<Layer>,
+}
+
+impl PresetFile {
+    pub fn from_doc(doc: &ProjectDoc, name: &str) -> Self {
+        let mut render = doc.render.clone();
+        render.ffmpeg_path = None; // machine specific
+        Self { version: PROJECT_VERSION, name: name.into(), render, config: doc.config.clone(), layers: doc.layers.clone() }
+    }
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let b = serde_json::to_vec_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, b)
+    }
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let b = std::fs::read(path).map_err(|e| format!("Cannot read preset: {e}"))?;
+        let mut p: PresetFile = serde_json::from_slice(&b).map_err(|e| format!("Preset file is damaged: {e}"))?;
+        p.config.refresh_premade_presets();
+        Ok(p)
+    }
+    /// Apply onto a project; audio and the machine-specific paths (output folder, ffmpeg) are kept.
+    pub fn apply_to(&self, doc: &mut ProjectDoc) {
+        let (dir, ff) = (doc.render.output_dir.clone(), doc.render.ffmpeg_path.clone());
+        doc.render = self.render.clone();
+        doc.render.output_dir = dir;
+        doc.render.ffmpeg_path = ff;
+        doc.config = self.config.clone();
+        doc.layers = self.layers.clone();
+        for i in 0..doc.layers.len() { doc.layers[i].id = doc.alloc_id(); }
+    }
 }
 
 // ── Autosave / recovery ──────────────────────────────────────

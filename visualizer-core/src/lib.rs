@@ -3,4 +3,7 @@ pub mod musicbee;
 pub mod config;
 pub mod color;
 pub mod decode;
+pub mod export;
+pub mod playback;
 pub mod project;
+pub mod waveform;

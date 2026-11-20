@@ -2336,7 +2336,7 @@ pub struct CustomReactivePreset {
 
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     // Layout
     pub bar_width: f32, pub bar_gap: f32, pub bar_radius: f32,

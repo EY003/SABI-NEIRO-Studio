@@ -138,3 +138,32 @@ pub fn decode_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, Dec
     if samples.is_empty() || channels == 0 { return Err(DecodeError::Empty); }
     Ok(DecodedAudio { samples, channels, sample_rate, meta })
 }
+
+/// Cheap metadata + duration without decoding the audio (used when files are imported).
+/// Duration is `None` for containers that do not declare a frame count.
+pub fn probe_file(path: &Path) -> Result<(TrackMeta, Option<f32>), DecodeError> {
+    let file = File::open(path).map_err(|e| DecodeError::Io(e.to_string()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) { hint.with_extension(ext); }
+    let mut probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| DecodeError::Unsupported(e.to_string()))?;
+    let mut meta = TrackMeta::default();
+    if let Some(md) = probed.metadata.get() {
+        if let Some(rev) = md.current() { read_rev(rev, &mut meta); }
+    }
+    let mut format = probed.format;
+    if let Some(rev) = format.metadata().current() { read_rev(rev, &mut meta); }
+    if meta.title.is_empty() {
+        meta.title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    }
+    let track = format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| DecodeError::Unsupported("no audio track".into()))?;
+    let p = &track.codec_params;
+    let dur = match (p.n_frames, p.sample_rate) {
+        (Some(n), Some(sr)) if sr > 0 => Some(n as f32 / sr as f32),
+        _ => None,
+    };
+    Ok((meta, dur))
+}
