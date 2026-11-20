@@ -5522,10 +5522,28 @@ impl VisualizerApp {
         self.layers_ui.selected = None;
     }
 
+    /// Show a problem once in the file panel (and keep the last few).
+    fn note(&mut self, msg: String) {
+        if self.studio.log.last() != Some(&msg) { self.studio.log.push(msg); }
+        if self.studio.log.len() > 50 { self.studio.log.remove(0); }
+    }
+
+    /// The shared offscreen renderer, created on first use. Failures are reported, not swallowed.
+    fn take_offscreen(&mut self, gl: Option<&Arc<glow::Context>>) -> Option<render::Offscreen> {
+        if let Some(o) = self.offscreen.take() { return Some(o); }
+        match gl {
+            Some(g) => match render::Offscreen::new(g.clone()) {
+                Ok(o) => Some(o),
+                Err(e) => { self.note(format!("GPU preview unavailable: {e}")); None }
+            },
+            None => { self.note("No OpenGL context: the preview needs eframe's glow backend.".into()); None }
+        }
+    }
+
     /// Run queued export jobs (any window mode).
     fn pump_render(&mut self, ctx: &egui::Context, gl: Option<&Arc<glow::Context>>) {
         if self.queue.jobs.is_empty() { return; }
-        let Some(mut off) = self.offscreen.take().or_else(|| gl.and_then(|g| render::Offscreen::new(g.clone()).ok())) else { return };
+        let Some(mut off) = self.take_offscreen(gl) else { return };
         let mut q = std::mem::replace(&mut self.queue, render::RenderQueue::new());
         q.pump(self, &mut off, ctx);
         self.queue = q;
@@ -5533,8 +5551,8 @@ impl VisualizerApp {
     }
 
     /// Preview through the same offscreen path as export. Returns false when there is no GL context.
-    fn render_preview(&mut self, ctx: &egui::Context, gl: Option<&Arc<glow::Context>>, area: egui::Rect) -> bool {
-        let Some(mut off) = self.offscreen.take().or_else(|| gl.and_then(|g| render::Offscreen::new(g.clone()).ok())) else { return false };
+    fn render_preview(&mut self, ctx: &egui::Context, gl: Option<&Arc<glow::Context>>, area: egui::Rect, painter: &egui::Painter) -> bool {
+        let Some(mut off) = self.take_offscreen(gl) else { return false };
         let s = self.render_ui.settings.clone();
         let aspect = s.width as f32 / s.height as f32;
         let mut size = area.size();
@@ -5571,11 +5589,13 @@ impl VisualizerApp {
             h.finish()
         };
         let (fr, fxs) = match &file_frame { Some((f, x)) => (Some(f), Some(x)), None => (None, None) };
-        let ok = self.draw_scene(&mut off, render::FrameInput {
+        let res = self.draw_scene(&mut off, render::FrameInput {
             main_ctx: ctx, cfg: None, frame: fr, fx: fxs, layers: &layers, comp: &mut comp, t, track_len,
             project_dir: &dir, palettes: None, meta: meta.as_ref(), cover_key: key, cover: cover.as_ref(),
             params: &params, bg: (!s.transparent).then_some(s.background),
-        }).is_ok();
+        });
+        let ok = res.is_ok();
+        if let Err(e) = res { self.note(e); }
         self.preview_comp = Some(comp);
 
         if ok {
@@ -5584,12 +5604,11 @@ impl VisualizerApp {
                 Some(tx) => tx.set(img, egui::TextureOptions::LINEAR),
                 None => self.preview_tex = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
             }
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("preview_layer")));
-            if s.transparent { draw_checkerboard(&painter, fit); }
+            if s.transparent { draw_checkerboard(painter, fit); }
             if let Some(tex) = &self.preview_tex {
                 painter.image(tex.id(), fit, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             }
-            if self.render_ui.show_guides { draw_guides(&painter, fit, aspect); }
+            if self.render_ui.show_guides { draw_guides(painter, fit, aspect); }
         }
         self.offscreen = Some(off);
         ok
@@ -5635,18 +5654,23 @@ impl VisualizerApp {
         self.project.tick(ctx, &self.config, cfg_fp, &self.render_ui.settings, &audio, audio_changed);
         if audio_changed { self.project.list_gen_seen = self.studio.list_gen; }
 
+        // The CentralPanel must come AFTER every side/top/bottom panel: it fills what is left and,
+        // being part of the same layer, never covers them.
         let screen = ctx.screen_rect();
-        let canvas = if self.mode == app_mode::WindowMode::Window { ctx.available_rect() } else { screen };
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("overlay")));
-        let c = self.config.bg_color;
-        painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
-        if !self.render_preview(ctx, gl.as_ref(), canvas) {
-            // no GL context available: draw directly
-            self.draw_bars(&painter, ctx, canvas, egui::Pos2::ZERO);
-            self.draw_track_info(&painter, ctx, egui::Pos2::ZERO, canvas);
-        }
+        let bg = self.config.bg_color;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(bg[0], bg[1], bg[2])))
+            .show(ctx, |ui| {
+                let canvas = ui.max_rect();
+                let painter = ui.painter().clone();
+                if !self.render_preview(ctx, gl.as_ref(), canvas, &painter) {
+                    // no GL preview available: draw the live visualizer directly
+                    self.draw_bars(&painter, ctx, canvas, egui::Pos2::ZERO);
+                    self.draw_track_info(&painter, ctx, egui::Pos2::ZERO, canvas);
+                }
+            });
         if self.config.show_diagnostics { self.draw_diagnostics_window(ctx); }
-        if self.settings_open.load(Ordering::Relaxed) { self.draw_settings_window(ctx, canvas, egui::Pos2::ZERO); }
+        if self.settings_open.load(Ordering::Relaxed) { self.draw_settings_window(ctx, screen, egui::Pos2::ZERO); }
         self.schedule_repaint(ctx);
     }
 }

@@ -371,6 +371,9 @@ impl Studio {
             if let Some(e) = self.player.error() {
                 ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Audio output: {e}"));
             }
+            for l in self.log.iter().rev().take(3) {
+                ui.colored_label(egui::Color32::from_rgb(255, 170, 90), egui::RichText::new(l).small());
+            }
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for e in &self.entries {

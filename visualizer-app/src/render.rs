@@ -71,10 +71,14 @@ impl Offscreen {
         })
     }
 
-    fn empty_frame(&self, logical: egui::Vec2) {
+    /// Run a frame with no content. Its texture uploads (the font atlas!) MUST reach the painter:
+    /// egui sends each texture only once, so dropping this output leaves every shape untextured.
+    fn empty_frame(&mut self, logical: egui::Vec2) {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, logical));
-        let _ = self.ctx.run(raw, |_| {});
+        let full = self.ctx.run(raw, |_| {});
+        for (id, delta) in &full.textures_delta.set { self.painter.set_texture(*id, delta); }
+        for id in &full.textures_delta.free { self.painter.free_texture(*id); }
     }
 
     /// Copy the main context's font definitions (custom track-info font) into this context.
