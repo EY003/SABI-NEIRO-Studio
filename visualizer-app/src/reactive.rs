@@ -145,6 +145,7 @@ fn prior_hist(center_db: f32, mass: f32) -> Vec<f32> {
     h
 }
 
+#[derive(Clone)]
 pub struct Dynamics {
     hist: Vec<f32>,
     total: f32,
@@ -287,7 +288,7 @@ impl Dynamics {
 // FxState
 // ───────────────────────────────────────────────────────────────
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct FxState {
     // Layout cache (rebuilt when the bar layout or region softness changes)
     layout_key: Option<(usize, FrequencyScaling, u32, u32, u32)>,

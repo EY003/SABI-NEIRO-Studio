@@ -5,6 +5,8 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use std::time::{Duration, Instant};
+
 use crate::overlay;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -24,9 +26,12 @@ pub struct WindowPrefs {
     /// Outer position / inner size of the normal window, in physical pixels.
     pub pos: [f32; 2],
     pub size: [f32; 2],
+    /// Scale factor (points -> physical pixels) the geometry above was saved with.
+    pub ppp: f32,
+    pub maximized: bool,
 }
 impl Default for WindowPrefs {
-    fn default() -> Self { Self { mode: WindowMode::Overlay, pos: [120.0, 80.0], size: [1280.0, 720.0] } }
+    fn default() -> Self { Self { mode: WindowMode::Overlay, pos: [120.0, 80.0], size: [1280.0, 720.0], ppp: 1.0, maximized: false } }
 }
 
 impl WindowPrefs {
@@ -49,7 +54,8 @@ impl WindowPrefs {
         self.size[0] = self.size[0].clamp(320.0, 16_384.0);
         self.size[1] = self.size[1].clamp(240.0, 16_384.0);
         if monitors.is_empty() { return self; }
-        let (x0, y0, x1, y1) = (self.pos[0], self.pos[1], self.pos[0] + self.size[0], self.pos[1] + self.size[1]);
+        let k = self.ppp.max(0.5); // geometry is stored in points; monitors are physical pixels
+        let (x0, y0, x1, y1) = (self.pos[0] * k, self.pos[1] * k, (self.pos[0] + self.size[0]) * k, (self.pos[1] + self.size[1]) * k);
         let visible = monitors.iter().any(|m| {
             let w = (x1.min(m[2] as f32) - x0.max(m[0] as f32)).max(0.0);
             let h = (y1.min(m[3] as f32) - y0.max(m[1] as f32)).max(0.0);
@@ -57,21 +63,63 @@ impl WindowPrefs {
         });
         if !visible {
             let m = monitors[0];
-            self.pos = [m[0] as f32 + 80.0, m[1] as f32 + 80.0];
-            self.size[0] = self.size[0].min((m[2] - m[0]) as f32 - 160.0);
-            self.size[1] = self.size[1].min((m[3] - m[1]) as f32 - 160.0);
+            self.pos = [(m[0] as f32 + 80.0) / k, (m[1] as f32 + 80.0) / k];
+            self.size[0] = self.size[0].min(((m[2] - m[0]) as f32 - 160.0) / k);
+            self.size[1] = self.size[1].min(((m[3] - m[1]) as f32 - 160.0) / k);
         }
         self
     }
 
     /// Call every frame while in `Window` mode; remembers where the user put the window.
     pub fn remember(&mut self, ctx: &egui::Context) {
-        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let (outer, inner, max) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().maximized));
+        self.ppp = ctx.pixels_per_point();
+        self.maximized = max.unwrap_or(false);
+        if self.maximized { return; } // keep the last normal rectangle for "restore"
         if let (Some(o), Some(i)) = (outer, inner) {
             if i.width() > 100.0 && i.height() > 100.0 {
                 self.pos = [o.min.x, o.min.y];
                 self.size = [i.width(), i.height()];
             }
+        }
+    }
+}
+
+/// Watches the monitor layout and DPI while the app runs (once per second).
+pub struct MonitorWatch { last: Vec<[i32; 4]>, last_ppp: f32, checked: Instant, refit: bool }
+
+impl MonitorWatch {
+    pub fn new() -> Self { Self { last: overlay::monitors(), last_ppp: 0.0, checked: Instant::now(), refit: false } }
+
+    pub fn poll(&mut self, ctx: &egui::Context, mode: WindowMode) {
+        use egui::ViewportCommand as C;
+        if self.refit { self.refit = false; ctx.send_viewport_cmd(C::Fullscreen(true)); return; }
+        if self.checked.elapsed() < Duration::from_secs(1) { return; }
+        self.checked = Instant::now();
+        let mons = overlay::monitors();
+        let ppp = ctx.pixels_per_point();
+        if mons == self.last && (ppp - self.last_ppp).abs() < 1e-3 { return; }
+        self.last = mons.clone();
+        self.last_ppp = ppp;
+        match mode {
+            WindowMode::Window => {
+                // A display was unplugged or rearranged and the window is now off-screen: pull it back.
+                if let Some(o) = ctx.input(|i| i.viewport().outer_rect) {
+                    let r = [o.min.x * ppp, o.min.y * ppp, o.max.x * ppp, o.max.y * ppp];
+                    let visible = mons.iter().any(|m| {
+                        (r[2].min(m[2] as f32) - r[0].max(m[0] as f32)) >= 120.0 && (r[3].min(m[3] as f32) - r[1].max(m[1] as f32)) >= 80.0
+                    });
+                    if !visible {
+                        if let Some(m) = mons.first() {
+                            ctx.send_viewport_cmd(C::OuterPosition(egui::pos2((m[0] as f32 + 80.0) / ppp, (m[1] as f32 + 80.0) / ppp)));
+                        }
+                    }
+                }
+            }
+            // Re-enter fullscreen so it snaps to the monitor the window is on now.
+            WindowMode::Fullscreen => { ctx.send_viewport_cmd(C::Fullscreen(false)); self.refit = true; }
+            // The overlay path re-fits itself every frame (it reads the monitor size each update).
+            WindowMode::Overlay => {}
         }
     }
 }
@@ -99,6 +147,7 @@ pub fn transition(
     prefs: &WindowPrefs,
 ) {
     use egui::ViewportCommand as C;
+    ctx.send_viewport_cmd(C::CursorVisible(true)); // fullscreen auto-hide may have hidden it
     match to {
         WindowMode::Overlay => {
             ctx.send_viewport_cmd(C::Fullscreen(false));
@@ -117,6 +166,7 @@ pub fn transition(
                 ctx.send_viewport_cmd(C::WindowLevel(egui::WindowLevel::Normal));
                 ctx.send_viewport_cmd(C::InnerSize(egui::vec2(prefs.size[0], prefs.size[1])));
                 ctx.send_viewport_cmd(C::OuterPosition(egui::pos2(prefs.pos[0], prefs.pos[1])));
+                ctx.send_viewport_cmd(C::Maximized(prefs.maximized));
             }
             ctx.send_viewport_cmd(C::Fullscreen(to == WindowMode::Fullscreen));
         }
