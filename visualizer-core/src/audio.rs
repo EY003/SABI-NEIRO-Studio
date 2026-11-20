@@ -2,6 +2,8 @@
 // audio.rs  —  full file
 // ═══════════════════════════════════════════════════════════════
 
+pub mod offline;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
