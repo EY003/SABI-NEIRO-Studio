@@ -108,6 +108,36 @@ pub fn crf_for(v: VideoCodec, quality: u8) -> u32 {
 /// points, so every pixel-valued setting looks identical at any output resolution.
 pub fn design_scale(w: u32, h: u32) -> f32 { w.min(h).max(1) as f32 / 1080.0 }
 
+// ── Preview canvas (independent of the export resolution) ─────
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum PreviewAspect { MatchExport, FitWindow, Ratio(u32, u32) }
+
+impl PreviewAspect {
+    pub const PRESETS: [(&'static str, PreviewAspect); 6] = [
+        ("16:9", PreviewAspect::Ratio(16, 9)), ("9:16", PreviewAspect::Ratio(9, 16)), ("1:1", PreviewAspect::Ratio(1, 1)),
+        ("4:3", PreviewAspect::Ratio(4, 3)), ("21:9", PreviewAspect::Ratio(21, 9)), ("3:4", PreviewAspect::Ratio(3, 4)),
+    ];
+    pub fn label(self) -> String {
+        match self {
+            PreviewAspect::MatchExport => "Same as export".into(),
+            PreviewAspect::FitWindow => "Fill the window".into(),
+            PreviewAspect::Ratio(w, h) => format!("{w}:{h}"),
+        }
+    }
+    /// Canvas size (pixels, only the proportions and the 1080-short-side scale matter) for this mode.
+    pub fn canvas(self, export: (u32, u32), window: (f32, f32)) -> (f32, f32) {
+        match self {
+            PreviewAspect::MatchExport => (export.0 as f32, export.1 as f32),
+            PreviewAspect::FitWindow => (window.0.max(2.0), window.1.max(2.0)),
+            PreviewAspect::Ratio(w, h) => {
+                let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+                if w >= h { (1080.0 * w / h, 1080.0) } else { (1080.0, 1080.0 * h / w) }
+            }
+        }
+    }
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -133,6 +163,10 @@ pub struct RenderSettings {
     pub name_template: String,
     pub collision: Collision,
     pub ffmpeg_path: Option<PathBuf>,
+    /// Shape of the PREVIEW canvas; does not change the export unless set to `MatchExport`.
+    pub preview: PreviewAspect,
+    /// Play and render every audio file back to back as ONE video.
+    pub sequence: bool,
 }
 impl Default for RenderSettings {
     fn default() -> Self {
@@ -142,6 +176,7 @@ impl Default for RenderSettings {
             audio_bitrate_kbps: 192, transparent: false, background: [0, 0, 0], hw_decode: true, range: None,
             output_dir: dirs::video_dir().unwrap_or_else(|| PathBuf::from(".")),
             name_template: "{artist} - {title}".into(), collision: Collision::AutoNumber, ffmpeg_path: None,
+            preview: PreviewAspect::MatchExport, sequence: false,
         }
     }
 }
@@ -217,28 +252,61 @@ pub fn video_args(s: &RenderSettings) -> Vec<String> {
 /// Full argument list. Frames arrive on stdin as raw RGBA, STRAIGHT (un-premultiplied) alpha,
 /// bottom-up (GL order), hence `vflip`. `out` should be a temp name (`*.part`); the format is
 /// forced with `-f` so the extension does not matter.
-pub fn build_args(s: &RenderSettings, audio: &Path, out: &Path, start: f64, dur: f64, extras: &[ExtraAudio]) -> Vec<String> {
+/// One audio file placed on the (global) timeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioSeg { pub path: PathBuf, pub start_s: f64, pub dur_s: f64 }
+
+pub fn build_args(s: &RenderSettings, audio: &[AudioSeg], out: &Path, start: f64, dur: f64, extras: &[ExtraAudio]) -> Vec<String> {
     let mut a: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error", "-nostats"].iter().map(|x| x.to_string()).collect();
     a.extend(["-f", "rawvideo", "-pix_fmt", "rgba", "-video_size"].iter().map(|x| x.to_string()));
     a.push(format!("{}x{}", s.width, s.height));
     a.extend(["-framerate".into(), fps_arg(s.fps), "-i".into(), "pipe:0".into()]);
-    a.extend(["-ss".into(), format!("{start:.6}"), "-t".into(), format!("{dur:.6}"), "-i".into(), audio.to_string_lossy().into_owned()]);
+
+    // Audio files that overlap [start, start+dur]; one file keeps the simple fast path.
+    let end = start + dur;
+    let mut used: Vec<&AudioSeg> = audio.iter().filter(|g| g.start_s + g.dur_s > start && g.start_s < end).collect();
+    if used.is_empty() { used = audio.iter().take(1).collect(); }
+    let single = used.len() <= 1;
+    let n_audio = used.len().max(1);
+    let main_label: String;
+    let mut fc: Vec<String> = Vec::new();
+    if single {
+        let g = used[0];
+        a.extend(["-ss".into(), format!("{:.6}", (start - g.start_s).max(0.0)), "-t".into(), format!("{dur:.6}"), "-i".into(), g.path.to_string_lossy().into_owned()]);
+        main_label = "[1:a]".into();
+    } else {
+        let mut labels = String::new();
+        for (i, g) in used.iter().enumerate() {
+            a.extend(["-i".into(), g.path.to_string_lossy().into_owned()]);
+            let ls = (start - g.start_s).max(0.0);
+            let le = (end - g.start_s).min(g.dur_s);
+            fc.push(format!("[{}:a]atrim=start={ls:.6}:end={le:.6},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[s{i}]", i + 1));
+            labels.push_str(&format!("[s{i}]"));
+        }
+        fc.push(format!("{labels}concat=n={}:v=0:a=1[aseq]", used.len()));
+        main_label = "[aseq]".into();
+    }
     for e in extras {
         a.extend(["-ss".into(), format!("{:.6}", e.seek_s), "-t".into(), format!("{dur:.6}"), "-i".into(), e.path.to_string_lossy().into_owned()]);
     }
     if extras.is_empty() {
-        a.extend(["-map", "0:v:0", "-map", "1:a:0"].iter().map(|x| x.to_string()));
+        if single {
+            a.extend(["-map", "0:v:0", "-map", "1:a:0"].iter().map(|x| x.to_string()));
+        } else {
+            a.extend(["-filter_complex".into(), fc.join(";"), "-map".into(), "0:v:0".into(), "-map".into(), "[aseq]".into()]);
+        }
     } else {
         // amix scales every input by 1/N, so multiply back by N to keep the main track at full level.
         let n = extras.len() + 1;
-        let mut fc = String::from("[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo[m0];");
+        fc.push(format!("{main_label}aformat=sample_fmts=fltp:channel_layouts=stereo[m0]"));
         for (i, e) in extras.iter().enumerate() {
             let ms = (e.delay_s * 1000.0).round().max(0.0) as u64;
-            fc.push_str(&format!("[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={ms}|{ms},volume={:.3}[m{}];", i + 2, e.volume, i + 1));
+            fc.push(format!("[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={ms}|{ms},volume={:.3}[m{}]", 1 + n_audio + i, e.volume, i + 1));
         }
-        for i in 0..n { fc.push_str(&format!("[m{i}]")); }
-        fc.push_str(&format!("amix=inputs={n}:duration=first:dropout_transition=0,volume={n}[aout]"));
-        a.extend(["-filter_complex".into(), fc, "-map".into(), "0:v:0".into(), "-map".into(), "[aout]".into()]);
+        let mut mix = String::new();
+        for i in 0..n { mix.push_str(&format!("[m{i}]")); }
+        fc.push(format!("{mix}amix=inputs={n}:duration=first:dropout_transition=0,volume={n}[aout]"));
+        a.extend(["-filter_complex".into(), fc.join(";"), "-map".into(), "0:v:0".into(), "-map".into(), "[aout]".into()]);
     }
 
     let rgb_out = s.video_codec == VideoCodec::Animation;
@@ -442,7 +510,7 @@ pub fn preflight(i: &PreflightInput) -> Vec<Issue> {
         Err(e) => err(&mut v, format!("Audio file is missing or unreadable ({e}): {}", i.audio_path.display())),
     }
     if let (Some((a, b)), Some(d)) = (s.range, i.audio_duration_s) {
-        if !(a >= 0.0 && b > a + 0.05 && b <= d as f64 + 0.05) { err(&mut v, format!("Render range {a:.1}s–{b:.1}s is outside the track (0–{d:.1}s).")); }
+        if !(a >= 0.0 && b > a + 0.05 && b <= d as f64 + 0.05) { err(&mut v, format!("Render range {a:.1}s-{b:.1}s is outside the track (0-{d:.1}s).")); }
     }
 
     if let Err(e) = std::fs::create_dir_all(&s.output_dir) { err(&mut v, format!("Cannot create output folder: {e}")); }
@@ -479,7 +547,8 @@ mod tests {
     #[test]
     fn h264_mp4_args() {
         let s = RenderSettings::default();
-        let a = build_args(&s, Path::new("a.flac"), Path::new("o.part"), 0.0, 10.0, &[]).join(" ");
+        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0 };
+        let a = build_args(&s, &[seg], Path::new("o.part"), 0.0, 10.0, &[]).join(" ");
         assert!(a.contains("-c:v libx264") && a.contains("-crf") && a.contains("yuv420p"));
         assert!(a.contains("-f mp4") && a.contains("vflip") && a.contains("-c:a aac"));
     }
@@ -487,8 +556,28 @@ mod tests {
     fn extra_audio_is_mixed() {
         let s = RenderSettings::default();
         let e = ExtraAudio { path: PathBuf::from("bg.mp4"), seek_s: 2.0, delay_s: 1.5, volume: 0.5 };
-        let a = build_args(&s, Path::new("a.flac"), Path::new("o.part"), 0.0, 10.0, &[e]).join(" ");
+        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0 };
+        let a = build_args(&s, &[seg], Path::new("o.part"), 0.0, 10.0, &[e]).join(" ");
         assert!(a.contains("amix=inputs=2") && a.contains("adelay=1500|1500") && a.contains("-map [aout]"));
+    }
+    #[test]
+    fn sequence_concat() {
+        let s = RenderSettings::default();
+        let segs = [AudioSeg { path: PathBuf::from("a.mp3"), start_s: 0.0, dur_s: 100.0 },
+                    AudioSeg { path: PathBuf::from("b.mp3"), start_s: 100.0, dur_s: 100.0 },
+                    AudioSeg { path: PathBuf::from("c.mp3"), start_s: 200.0, dur_s: 100.0 }];
+        // range 90..210 touches all three; trims: a 90..100, b 0..100, c 0..10
+        let a = build_args(&s, &segs, Path::new("o.part"), 90.0, 120.0, &[]).join(" ");
+        assert!(a.contains("concat=n=3") && a.contains("atrim=start=90.000000:end=100.000000") && a.contains("atrim=start=0.000000:end=10.000000"));
+        // a range inside one file keeps the simple path
+        let a = build_args(&s, &segs, Path::new("o.part"), 110.0, 10.0, &[]).join(" ");
+        assert!(!a.contains("concat") && a.contains("-ss 10.000000"));
+    }
+    #[test]
+    fn preview_canvas() {
+        assert_eq!(PreviewAspect::Ratio(9, 16).canvas((1920, 1080), (800.0, 600.0)), (1080.0, 1920.0));
+        assert_eq!(PreviewAspect::MatchExport.canvas((1920, 1080), (800.0, 600.0)), (1920.0, 1080.0));
+        assert_eq!(PreviewAspect::FitWindow.canvas((1920, 1080), (800.0, 600.0)), (800.0, 600.0));
     }
     #[test]
     fn alpha_rules() {

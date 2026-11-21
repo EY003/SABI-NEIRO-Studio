@@ -11,6 +11,8 @@ use crate::export::RenderSettings;
 
 pub const PROJECT_VERSION: u32 = 1;
 
+fn default_scale() -> f32 { 1.0 }
+
 // ── Media references (relinking / portability) ───────────────
 
 /// Equality is by path only: `rel`/`size` are bookkeeping and must not count as an edit.
@@ -86,8 +88,8 @@ impl Default for TextLayer {
 pub enum LayerKind {
     /// The visualizer itself; its look is `ProjectDoc::config`.
     Visualizer,
-    Image { media: MediaRef, fit: FitMode, offset: [f32; 2] },
-    Video { media: MediaRef, fit: FitMode, offset: [f32; 2], looping: bool, mute: bool, trim_start_s: f64 },
+    Image { media: MediaRef, fit: FitMode, offset: [f32; 2], #[serde(default = "default_scale")] scale: f32 },
+    Video { media: MediaRef, fit: FitMode, offset: [f32; 2], #[serde(default = "default_scale")] scale: f32, looping: bool, mute: bool, trim_start_s: f64 },
     Text(TextLayer),
 }
 
