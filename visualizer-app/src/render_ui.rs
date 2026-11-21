@@ -124,7 +124,7 @@ impl RenderUi {
         } else if let Some(c) = &self.caps {
             ui.small(format!("{}  ·  GPU encoders: {}", c.version.split(" Copyright").next().unwrap_or(""),
                 if c.working.is_empty() { "none detected".to_string() } else { let mut v: Vec<_> = c.working.iter().cloned().collect(); v.sort(); v.join(", ") }));
-        } else { ui.small("Looking for ffmpeg\u{2026}"); }
+        } else { ui.small("Looking for ffmpeg..."); }
         ui.separator();
 
         // ── video ──
@@ -224,13 +224,12 @@ impl RenderUi {
             }
             if let Some((a, b)) = &mut self.settings.range {
                 ui.add(egui::DragValue::new(a).clamp_range(0.0..=dur as f64).speed(0.1).suffix(" s"));
-                if ui.small_button("\u{21E4} playhead").clicked() { *a = pos; }
+                if ui.small_button("from playhead").clicked() { *a = pos; }
                 ui.label("to");
                 ui.add(egui::DragValue::new(b).clamp_range(0.0..=dur as f64).speed(0.1).suffix(" s"));
-                if ui.small_button("\u{21E5} playhead").clicked() { *b = pos; }
+                if ui.small_button("from playhead").clicked() { *b = pos; }
             }
         });
-        ui.checkbox(&mut self.show_guides, "Show safe-area guides in preview");
 
         // ── output ──
         ui.separator();
@@ -238,7 +237,7 @@ impl RenderUi {
             ui.label("Folder");
             let mut txt = self.settings.output_dir.display().to_string();
             if ui.add(egui::TextEdit::singleline(&mut txt).desired_width(280.0)).changed() { self.settings.output_dir = PathBuf::from(txt); }
-            if ui.button("Browse\u{2026}").clicked() {
+            if ui.button("Browse...").clicked() {
                 let (tx, rx) = channel();
                 self.folder_rx = Some(rx);
                 let start = self.settings.output_dir.clone();
@@ -263,7 +262,21 @@ impl RenderUi {
         let stale = self.checked_for.as_ref() != Some(&key) || self.checked_at.map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true);
         if stale {
             self.issues.clear();
-            if let (Some(e), Some(a)) = (entry, &audio) {
+            if self.settings.sequence {
+                match studio.sequence_segments() {
+                    Some(segs) => {
+                        let total = segs.last().map(|g| g.start_s + g.dur_s).unwrap_or(0.0) as f32;
+                        let (t0, a0) = studio.entries.first().map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
+                        let out = output_path(&self.settings, &t0, &a0, 1);
+                        self.issues = preflight(&PreflightInput { settings: &self.settings, caps: self.caps.as_ref(), audio_path: &segs[0].path,
+                            audio_duration_s: Some(total), free_bytes: free_bytes(&self.settings.output_dir), out_path: &out });
+                        for g in &segs {
+                            if !g.path.is_file() { self.issues.push(Issue { severity: Severity::Error, message: format!("Track is missing: {}", g.path.display()) }); }
+                        }
+                    }
+                    None => self.issues.push(Issue { severity: Severity::Error, message: "One timeline: wait until every track shows its length (or remove the one that failed).".into() }),
+                }
+            } else if let (Some(e), Some(a)) = (entry, &audio) {
                 let out = output_path(&self.settings, &e.meta.title, &e.meta.artist, 1);
                 self.issues = preflight(&PreflightInput { settings: &self.settings, caps: self.caps.as_ref(), audio_path: a,
                     audio_duration_s: e.duration, free_bytes: free_bytes(&self.settings.output_dir), out_path: &out });
@@ -277,7 +290,7 @@ impl RenderUi {
         let has_error = all.iter().any(|i| i.severity == Severity::Error);
         let mut quick_fix = None;
         for i in &all {
-            let (col, tag) = if i.severity == Severity::Error { (egui::Color32::from_rgb(255, 110, 110), "\u{26D4}") } else { (egui::Color32::from_rgb(240, 190, 80), "\u{26A0}") };
+            let (col, tag) = if i.severity == Severity::Error { (egui::Color32::from_rgb(255, 110, 110), "Error:") } else { (egui::Color32::from_rgb(240, 190, 80), "Warning:") };
             ui.colored_label(col, format!("{tag} {}", i.message));
         }
         if self.settings.transparent && all.iter().any(|i| i.message.contains("transparency")) {
@@ -287,19 +300,29 @@ impl RenderUi {
             });
         }
         if let Some((c, v)) = quick_fix { self.settings.container = c; self.settings.video_codec = v; self.settings.hw = HwAccel::None; self.fix_container(); self.checked_for = None; }
-        if let Some(e) = entry {
-            let d = self.settings.range.map(|(a, b)| b - a).or(e.duration.map(|x| x as f64)).unwrap_or(0.0);
-            ui.small(format!("Estimated size \u{2248} {}", human_bytes(estimate_bytes(&self.settings, d))));
+        if entry.is_some() {
+            let total = if self.settings.sequence { studio.total_duration_s() as f64 } else { entry.and_then(|e| e.duration).unwrap_or(0.0) as f64 };
+            let d = self.settings.range.map(|(a, b)| b - a).unwrap_or(total);
+            ui.small(format!("Estimated size about {}", human_bytes(estimate_bytes(&self.settings, d))));
         }
 
         // ── actions ──
         ui.horizontal(|ui| {
             let ready = !has_error && self.caps.is_some();
-            if ui.add_enabled(ready, egui::Button::new("Add to queue")).clicked() {
-                if let Some(e) = entry { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), 1, true, layers, project_dir); }
-            }
-            if ui.add_enabled(self.caps.is_some() && !studio.entries.is_empty(), egui::Button::new("Queue all tracks")).on_hover_text("Uses the settings above for every audio file (range ignored)").clicked() {
-                for (n, e) in studio.entries.iter().enumerate() { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), n + 1, false, layers, project_dir); }
+            if self.settings.sequence {
+                if ui.add_enabled(ready, egui::Button::new("Add the whole sequence to queue")).clicked() {
+                    if let Some(segs) = studio.sequence_segments() {
+                        let (t0, a0) = studio.entries.first().map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
+                        self.enqueue(queue, cfg, t0, a0, segs[0].path.clone(), 1, true, layers, project_dir, segs);
+                    }
+                }
+            } else {
+                if ui.add_enabled(ready, egui::Button::new("Add to queue")).clicked() {
+                    if let Some(e) = entry { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), 1, true, layers, project_dir, Vec::new()); }
+                }
+                if ui.add_enabled(self.caps.is_some() && !studio.entries.is_empty(), egui::Button::new("Queue all tracks (one video each)")).on_hover_text("Uses the settings above for every audio file (range ignored)").clicked() {
+                    for (n, e) in studio.entries.iter().enumerate() { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), n + 1, false, layers, project_dir, Vec::new()); }
+                }
             }
         });
 
@@ -308,6 +331,14 @@ impl RenderUi {
         ui.horizontal(|ui| {
             ui.heading("Queue");
             if ui.small_button("Clear finished").clicked() { queue.clear_finished(); }
+        });
+        ui.horizontal(|ui| {
+            ui.small(format!("Log files: {}", human_bytes(crate::render::log_size())));
+            if ui.small_button("Clear log files").on_hover_text("Deletes the files in %LOCALAPPDATA%\\RustVisualizer\\logs and empties the job logs below").clicked() {
+                crate::render::clear_logs();
+                for j in queue.jobs.iter_mut() { j.log.clear(); }
+                self.log_job = None;
+            }
         });
         let ids: Vec<u64> = queue.jobs.iter().map(|j| j.id).collect();
         let (mut cancel, mut retry, mut remove, mut mv): (Option<u64>, Option<u64>, Option<u64>, Option<(u64, i32)>) = (None, None, None, None);
@@ -318,22 +349,22 @@ impl RenderUi {
                     ui.strong(&j.title);
                     ui.label(format!("{}x{} {} {}", j.settings.width, j.settings.height, j.settings.video_codec.label(), j.settings.container.label()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("\u{2715}").clicked() { remove = Some(j.id); }
+                        if ui.small_button("x").clicked() { remove = Some(j.id); }
                         if !j.is_active() {
-                            if ui.small_button("\u{25BC}").clicked() { mv = Some((j.id, 1)); }
-                            if ui.small_button("\u{25B2}").clicked() { mv = Some((j.id, -1)); }
+                            if ui.small_button("v").clicked() { mv = Some((j.id, 1)); }
+                            if ui.small_button("^").clicked() { mv = Some((j.id, -1)); }
                         }
                     });
                 });
                 match &j.state {
-                    JobState::Queued => { ui.label("Waiting\u{2026}"); }
+                    JobState::Queued => { ui.label("Waiting..."); }
                     JobState::Preparing => { ui.add(egui::ProgressBar::new(j.progress).text(format!("Analysing audio {:.0}%", j.progress * 100.0))); }
                     JobState::Rendering | JobState::Finishing => {
                         let eta = j.eta_s.map(|e| format!("  ETA {}", mmss(e))).unwrap_or_default();
-                        let label = if j.state == JobState::Finishing { "Finalising file\u{2026}".to_string() } else { format!("{:.0}%{eta}", j.progress * 100.0) };
+                        let label = if j.state == JobState::Finishing { "Finalising file...".to_string() } else { format!("{:.0}%{eta}", j.progress * 100.0) };
                         ui.add(egui::ProgressBar::new(j.progress).text(label));
                     }
-                    JobState::Done => { ui.colored_label(egui::Color32::from_rgb(110, 210, 130), format!("Done in {} \u{2192} {}", mmss(j.elapsed_s), j.out_path.display())); }
+                    JobState::Done => { ui.colored_label(egui::Color32::from_rgb(110, 210, 130), format!("Done in {} -> {}", mmss(j.elapsed_s), j.out_path.display())); }
                     JobState::Failed(e) => { ui.colored_label(egui::Color32::from_rgb(255, 110, 110), e); }
                     JobState::Cancelled => { ui.label("Cancelled"); }
                 }
@@ -344,8 +375,8 @@ impl RenderUi {
                         let _ = std::process::Command::new("explorer").arg(format!("/select,{}", j.out_path.display())).spawn();
                     }
                     if matches!(j.state, JobState::Queued | JobState::Failed(_) | JobState::Cancelled) {
-                        if ui.small_button("Settings \u{2192} panel").on_hover_text("Load this job's render settings into the panel").clicked() { load_into_panel = Some(j.id); }
-                        if ui.small_button("Panel \u{2192} job").on_hover_text("Replace this job's render settings with the panel's (keeps its time range)").clicked() { apply_panel = Some(j.id); }
+                        if ui.small_button("Load into panel").on_hover_text("Load this job's render settings into the panel").clicked() { load_into_panel = Some(j.id); }
+                        if ui.small_button("Apply panel settings").on_hover_text("Replace this job's render settings with the panel's (keeps its time range)").clicked() { apply_panel = Some(j.id); }
                         if ui.small_button("Use current look").on_hover_text("Re-snapshot visualizer settings and layers into this job").clicked() { refresh_look = Some(j.id); }
                     }
                     if ui.small_button(if self.log_job == Some(j.id) { "Hide log" } else { "Log" }).clicked() {
@@ -379,12 +410,13 @@ impl RenderUi {
     }
 
     fn enqueue(&mut self, queue: &mut RenderQueue, cfg: &AppConfig, title: String, artist: String, audio: PathBuf, n: usize, with_range: bool,
-               layers: &[Layer], project_dir: &Path) {
+               layers: &[Layer], project_dir: &Path, segments: Vec<AudioSeg>) {
         let Some(caps) = &self.caps else { return };
         let mut s = self.settings.clone();
         if !with_range { s.range = None; }
         let out = resolve_collision(output_path(&s, &title, &artist, n), s.collision, &queue.taken_paths());
-        let label = if artist.is_empty() { title } else { format!("{artist} \u{2013} {title}") };
-        queue.add(label, audio, cfg.clone(), s, caps.path.clone(), out, layers.to_vec(), project_dir.to_path_buf());
+        let label = if !segments.is_empty() { format!("Sequence of {} tracks: {}", segments.len(), title) }
+                    else if artist.is_empty() { title } else { format!("{artist} - {title}") };
+        queue.add(label, audio, cfg.clone(), s, caps.path.clone(), out, layers.to_vec(), project_dir.to_path_buf(), segments);
     }
 }

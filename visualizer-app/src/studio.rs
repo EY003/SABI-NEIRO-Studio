@@ -42,7 +42,7 @@ pub struct Entry {
 impl Entry {
     fn display(&self) -> String {
         if self.meta.artist.is_empty() { self.meta.title.clone() }
-        else { format!("{} \u{2013} {}", self.meta.artist, self.meta.title) }
+        else { format!("{} - {}", self.meta.artist, self.meta.title) }
     }
 }
 
@@ -59,6 +59,9 @@ enum Msg {
 }
 
 enum Action { Select(u64), Remove(u64), Move(u64, i32) }
+
+/// What the floating bar (shown while the panels are hidden) asked for.
+pub enum OverlayAct { ShowPanels, ExitFullscreen }
 
 pub struct Studio {
     pub entries: Vec<Entry>,
@@ -86,10 +89,21 @@ pub struct Studio {
     /// Bumped whenever the list of files changes (add / remove / reorder / project load).
     pub list_gen: u64,
     timeline: Timeline,
+    /// All tracks form ONE timeline (set by the app from the render settings).
+    pub sequence: bool,
+    pending_seek: Option<f32>,
     mark_in: bool,
     mark_out: bool,
     last_mouse: Instant,
     cursor_visible: bool,
+}
+
+/// Metadata + length. Some containers (VBR mp3 without a header) declare no length: decode once to measure it.
+fn probe_with_duration(path: &std::path::Path) -> Result<(TrackMeta, Option<f32>), String> {
+    let (meta, dur) = decode::probe_file(path).map_err(|e| e.to_string())?;
+    if dur.is_some() { return Ok((meta, dur)); }
+    let d = decode::decode_file(path, &AtomicBool::new(false)).map_err(|e| e.to_string())?;
+    Ok((meta, Some(d.duration_s())))
 }
 
 fn fmt_time(s: f32) -> String {
@@ -107,7 +121,7 @@ impl Studio {
             want_play: false, autoplay_next: true, fps: 60.0,
             seen_audio: None, seen_reactive: None, stale_since: None,
             pending_track_info: None, log: vec![], list_gen: 0,
-            timeline: Timeline::new(), mark_in: false, mark_out: false, last_mouse: Instant::now(), cursor_visible: true,
+            timeline: Timeline::new(), sequence: false, pending_seek: None, mark_in: false, mark_out: false, last_mouse: Instant::now(), cursor_visible: true,
         }
     }
 
@@ -141,12 +155,7 @@ impl Studio {
             self.next_id += 1;
             self.entries.push(Entry { id, path: path.clone(), meta: TrackMeta::default(), duration: None, status: Status::Pending });
             self.list_gen += 1;
-            let (tx, ctx2) = (self.tx.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                let res = decode::probe_file(&path).map_err(|e| e.to_string());
-                let _ = tx.send(Msg::Probed { id, res });
-                ctx2.request_repaint();
-            });
+            self.spawn_probe(ctx, id, path);
         }
         if self.selected.is_none() {
             if let Some(first) = self.entries.first().map(|e| e.id) { self.select(ctx, first, false); }
@@ -266,6 +275,7 @@ impl Studio {
                                 e.meta = meta;
                             }
                             self.player.set_track(Some(track.clone()));
+                            if let Some(t) = self.pending_seek.take() { self.player.seek(t); }
                             self.loaded = Some(Loaded { id, track, wave });
                             self.spawn_analysis(ctx, cfg);
                         }
@@ -310,7 +320,7 @@ impl Studio {
         }
 
         // End of track -> next entry (same code path as clicking it, so sync is identical).
-        if self.player.ended() && self.autoplay_next {
+        if self.player.ended() && (self.autoplay_next || self.sequence) {
             if let Some(i) = self.entries.iter().position(|e| Some(e.id) == self.selected) {
                 if let Some(next) = self.entries.get(i + 1).map(|e| e.id) { self.select(ctx, next, true); }
             }
@@ -329,8 +339,6 @@ impl Studio {
     // ── input ───────────────────────────────────────────────
 
     pub fn handle_input(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if !dropped.is_empty() { self.add_files(ctx, dropped); }
         if ctx.wants_keyboard_input() { return; }
 
         use egui::{Key, Modifiers as M};
@@ -342,62 +350,114 @@ impl Studio {
             i.consume_key(M::NONE, Key::I), i.consume_key(M::NONE, Key::O),
         ));
         if space { self.player.toggle(); }
-        if l5 { self.seek_rel(-5.0); }
-        if r5 { self.seek_rel(5.0); }
-        if l1 { self.seek_rel(-1.0); }
-        if r1 { self.seek_rel(1.0); }
-        if home { self.player.seek(0.0); }
+        if l5 { self.seek_rel(ctx, -5.0); }
+        if r5 { self.seek_rel(ctx, 5.0); }
+        if l1 { self.seek_rel(ctx, -1.0); }
+        if r1 { self.seek_rel(ctx, 1.0); }
+        if home { self.seek_global(ctx, 0.0); }
         if open { self.open_dialog(ctx); }
         if mi { self.mark_in = true; }
         if mo { self.mark_out = true; }
     }
 
-    fn seek_rel(&self, d: f32) {
-        let dur = self.loaded.as_ref().map(|l| l.track.duration_s()).unwrap_or(0.0);
-        self.player.seek((self.player.position_s() + d).clamp(0.0, dur));
+    fn seek_rel(&mut self, ctx: &egui::Context, d: f32) {
+        let t = (self.global_pos_s() + d).clamp(0.0, self.total_duration_s());
+        self.seek_global(ctx, t);
+    }
+
+    // ── one timeline over several tracks ────────────────────
+
+    fn sel_index(&self) -> Option<usize> { self.entries.iter().position(|e| Some(e.id) == self.selected) }
+
+    /// Start of every track on the sequence timeline (+ the total at the end). Unknown lengths count as 0.
+    pub fn offsets(&self) -> Vec<f32> {
+        let mut v = Vec::with_capacity(self.entries.len() + 1);
+        let mut acc = 0.0;
+        v.push(0.0);
+        for e in &self.entries { acc += e.duration.unwrap_or(0.0); v.push(acc); }
+        v
+    }
+    pub fn total_duration_s(&self) -> f32 {
+        if self.sequence { self.offsets().last().copied().unwrap_or(0.0) } else { self.duration_s() }
+    }
+    /// Playhead on the whole timeline (equals `position_s` when not in sequence mode).
+    pub fn global_pos_s(&self) -> f32 {
+        let local = self.player.position_s();
+        if self.sequence { self.sel_index().map(|i| self.offsets()[i]).unwrap_or(0.0) + local } else { local }
+    }
+    /// Seek on the whole timeline; switches track when `t` lies in another one.
+    pub fn seek_global(&mut self, ctx: &egui::Context, t: f32) {
+        if !self.sequence { self.player.seek(t); return; }
+        let offs = self.offsets();
+        let n = self.entries.len();
+        if n == 0 { return; }
+        let j = (0..n).rev().find(|&j| offs[j] <= t).unwrap_or(0);
+        let local = (t - offs[j]).max(0.0);
+        if Some(j) == self.sel_index() { self.player.seek(local); }
+        else {
+            let play = self.player.is_playing();
+            self.pending_seek = Some(local);
+            let id = self.entries[j].id;
+            self.select(ctx, id, play);
+        }
+    }
+    /// All tracks as export segments; `None` while a length is unknown or a file failed.
+    pub fn sequence_segments(&self) -> Option<Vec<visualizer_core::export::AudioSeg>> {
+        if self.entries.is_empty() { return None; }
+        let offs = self.offsets();
+        let mut v = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if matches!(e.status, Status::Failed(_)) { return None; }
+            let d = e.duration?;
+            v.push(visualizer_core::export::AudioSeg { path: e.path.clone(), start_s: offs[i] as f64, dur_s: d as f64 });
+        }
+        Some(v)
     }
 
     // ── UI ──────────────────────────────────────────────────
 
-    pub fn ui_left(&mut self, ctx: &egui::Context) {
+    /// Sidebar "Audio" tab. Rows are clipped, so a long song name can never widen the sidebar.
+    pub fn ui_audio(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sequence: &mut bool) {
         let mut action: Option<Action> = None;
-        egui::SidePanel::left("studio_files").default_width(280.0).resizable(true).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Audio");
-                if ui.button("\u{FF0B} Add\u{2026}").clicked() { self.open_dialog(ctx); }
-            });
-            ui.small("Drop files here, or Ctrl+I");
-            ui.checkbox(&mut self.autoplay_next, "Play next automatically");
-            if let Some(e) = self.player.error() {
-                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Audio output: {e}"));
-            }
-            for l in self.log.iter().rev().take(3) {
-                ui.colored_label(egui::Color32::from_rgb(255, 170, 90), egui::RichText::new(l).small());
-            }
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for e in &self.entries {
-                    ui.horizontal(|ui| {
-                        let sel = Some(e.id) == self.selected;
-                        let dur = e.duration.map(fmt_time).unwrap_or_else(|| "--:--".into());
-                        if ui.selectable_label(sel, format!("{}  [{}]", e.display(), dur)).clicked() {
-                            action = Some(Action::Select(e.id));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("\u{2715}").on_hover_text("Remove").clicked() { action = Some(Action::Remove(e.id)); }
-                            if ui.small_button("\u{25BC}").clicked() { action = Some(Action::Move(e.id, 1)); }
-                            if ui.small_button("\u{25B2}").clicked() { action = Some(Action::Move(e.id, -1)); }
-                        });
-                    });
-                    match &e.status {
-                        Status::Loading => { ui.small("Decoding\u{2026}"); }
-                        Status::Analyzing => { ui.small(format!("Analysing\u{2026} {:.0}%", self.progress * 100.0)); }
-                        Status::Failed(err) => { ui.colored_label(egui::Color32::from_rgb(255, 120, 120), egui::RichText::new(err).small()); }
-                        _ => {}
-                    }
-                }
-            });
+        ui.horizontal(|ui| {
+            if ui.button("+ Add audio...").clicked() { self.open_dialog(ctx); }
+            ui.small("or drop files / Ctrl+I");
         });
+        ui.checkbox(sequence, "One timeline: all tracks back to back")
+            .on_hover_text("Off: every track is its own timeline and its own video.\nOn: tracks are placed one after another; playback, the timeline and the export treat them as ONE long video.");
+        if !*sequence { ui.checkbox(&mut self.autoplay_next, "Play next track automatically"); }
+        if let Some(e) = self.player.error() {
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Audio output: {e}"));
+        }
+        for l in self.log.iter().rev().take(3) {
+            let w = ui.available_width();
+            crate::ui_util::clipped_label(ui, l, w, true, Some(egui::Color32::from_rgb(255, 170, 90)));
+        }
+        ui.separator();
+
+        let offs = self.offsets();
+        let seq = *sequence;
+        for (i, e) in self.entries.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let sel = Some(e.id) == self.selected;
+                let dur = e.duration.map(fmt_time).unwrap_or_else(|| "--:--".into());
+                let label = if seq { format!("{}  {}  [{}]", fmt_time(offs[i]), e.display(), dur) } else { format!("{}  [{}]", e.display(), dur) };
+                let width = (ui.available_width() - 76.0).max(40.0);
+                if crate::ui_util::clipped_selectable(ui, sel, &label, width).clicked() { action = Some(Action::Select(e.id)); }
+                if ui.small_button("x").on_hover_text("Remove from the list").clicked() { action = Some(Action::Remove(e.id)); }
+                if ui.small_button("v").on_hover_text("Move down").clicked() { action = Some(Action::Move(e.id, 1)); }
+                if ui.small_button("^").on_hover_text("Move up").clicked() { action = Some(Action::Move(e.id, -1)); }
+            });
+            match &e.status {
+                Status::Loading => { ui.small("   decoding..."); }
+                Status::Analyzing => { ui.small(format!("   analysing... {:.0}%", self.progress * 100.0)); }
+                Status::Failed(err) => {
+                    let w = ui.available_width();
+                    crate::ui_util::clipped_label(ui, err, w, true, Some(egui::Color32::from_rgb(255, 110, 110)));
+                }
+                _ => {}
+            }
+        }
         match action {
             Some(Action::Select(id)) => self.select(ctx, id, false),
             Some(Action::Remove(id)) => self.remove(ctx, id),
@@ -406,11 +466,10 @@ impl Studio {
         }
     }
 
-    /// Transport + timeline. `range` is the render range (I / O keys or drag the markers),
-    /// `layers` are shown as draggable bars, `selected_layer` is shared with the layer panel.
+    /// Transport + timeline. The panel is resizable (drag its top edge); the waveform fills the height.
     pub fn ui_bottom(&mut self, ctx: &egui::Context, range: &mut Option<(f64, f64)>, layers: &mut [Layer], selected_layer: &mut Option<u64>) {
-        let dur = self.loaded.as_ref().map(|l| l.track.duration_s()).unwrap_or(0.0);
-        let pos = self.player.position_s();
+        let dur = self.total_duration_s();
+        let pos = self.global_pos_s();
         let has_track = self.loaded.is_some();
         if dur > 0.0 {
             let p = pos as f64;
@@ -418,15 +477,21 @@ impl Studio {
             if std::mem::take(&mut self.mark_out) { let a = range.map(|r| r.0).unwrap_or(0.0); *range = Some((a, p.max(a + 0.05).min(dur as f64))); }
         } else { self.mark_in = false; self.mark_out = false; }
 
+        let offs = self.offsets();
+        let segs: Vec<timeline::Seg> = if self.sequence {
+            self.entries.iter().enumerate().map(|(i, e)| timeline::Seg { start: offs[i], len: e.duration.unwrap_or(0.0), name: e.display(), current: Some(e.id) == self.selected }).collect()
+        } else { Vec::new() };
+        let wave_off = if self.sequence { self.sel_index().map(|i| offs[i]).unwrap_or(0.0) } else { 0.0 };
+
         let mut jump: Option<i32> = None;
         let mut seek: Option<f32> = None;
-        egui::TopBottomPanel::bottom("studio_transport").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("studio_transport").resizable(true).default_height(200.0).height_range(130.0..=720.0).show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("\u{23EE}").on_hover_text("Previous track").clicked() { jump = Some(-1); }
-                let label = if self.player.is_playing() { "\u{23F8} Pause" } else { "\u{25B6} Play" };
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Prev").on_hover_text("Previous track").clicked() { jump = Some(-1); }
+                let label = if self.player.is_playing() { "Pause" } else { "Play" };
                 if ui.add_enabled(has_track, egui::Button::new(label)).clicked() { self.player.toggle(); }
-                if ui.button("\u{23ED}").on_hover_text("Next track").clicked() { jump = Some(1); }
+                if ui.button("Next").on_hover_text("Next track").clicked() { jump = Some(1); }
                 ui.monospace(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
                 let mut v = self.player.volume();
                 ui.label("Vol");
@@ -434,24 +499,29 @@ impl Studio {
                 ui.separator();
                 match *range {
                     Some((a, b)) => {
-                        ui.colored_label(egui::Color32::from_rgb(255, 160, 40), format!("Render {} \u{2192} {}  ({})", fmt_time(a as f32), fmt_time(b as f32), fmt_time((b - a) as f32)));
+                        ui.colored_label(egui::Color32::from_rgb(255, 160, 40), format!("Render {} - {}  ({})", fmt_time(a as f32), fmt_time(b as f32), fmt_time((b - a) as f32)));
+                        if ui.small_button("Zoom to it").clicked() { self.timeline.zoom_range(a as f32, b as f32, dur.max(0.5)); }
                         if ui.small_button("Clear").clicked() { *range = None; }
                     }
                     None => { ui.small("I / O: set render in / out"); }
                 }
-                if ui.small_button("Fit").on_hover_text("Show the whole track (Ctrl+wheel zooms)").clicked() { self.timeline.fit(); }
+                ui.separator();
+                if ui.small_button("-").on_hover_text("Zoom out").clicked() { self.timeline.zoom_step(1.0 / 1.6, pos, dur.max(0.5)); }
+                if ui.small_button("+").on_hover_text("Zoom in").clicked() { self.timeline.zoom_step(1.6, pos, dur.max(0.5)); }
+                if ui.small_button("Fit").on_hover_text("Show the whole timeline").clicked() { self.timeline.fit(); }
             });
             let out = self.timeline.ui(ui, timeline::In {
-                dur, pos, playing: self.player.is_playing(), wave: self.loaded.as_ref().map(|l| &*l.wave),
-                range, layers, selected: selected_layer, analysing: if self.analyzing { Some(self.progress) } else { None },
+                dur, pos, playing: self.player.is_playing(),
+                wave: self.loaded.as_ref().map(|l| (wave_off, &*l.wave)),
+                segs: &segs, range, layers, selected: selected_layer,
+                analysing: if self.analyzing { Some(self.progress) } else { None },
             });
             seek = out.seek;
-            ui.add_space(4.0);
         });
-        if let Some(t) = seek { self.player.seek(t); }
+        if let Some(t) = seek { self.seek_global(ctx, t); }
 
         if let Some(d) = jump {
-            if let Some(i) = self.entries.iter().position(|e| Some(e.id) == self.selected) {
+            if let Some(i) = self.sel_index() {
                 let j = i as i32 + d;
                 if j >= 0 { if let Some(id) = self.entries.get(j as usize).map(|e| e.id) {
                     let play = self.player.is_playing();
@@ -461,34 +531,37 @@ impl Studio {
         }
     }
 
-    /// Fullscreen: a floating transport that appears on mouse movement and hides (with the
-    /// cursor) after 2.5 s. Returns true when the user asked to leave fullscreen.
-    pub fn ui_fullscreen_overlay(&mut self, ctx: &egui::Context) -> bool {
+    /// Floating transport shown while the panels are hidden: appears on mouse movement, hides (with the
+    /// cursor) after 2.5 s.
+    pub fn ui_overlay(&mut self, ctx: &egui::Context, fullscreen: bool) -> Option<OverlayAct> {
         let moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_down() || i.pointer.any_click());
         if moved { self.last_mouse = Instant::now(); }
         let active = self.last_mouse.elapsed() < Duration::from_millis(2500);
-        if active != self.cursor_visible {
+        if fullscreen && active != self.cursor_visible {
             self.cursor_visible = active;
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(active));
         }
-        if active { ctx.request_repaint_after(Duration::from_millis(300)); } else { return false; }
-        let dur = self.loaded.as_ref().map(|l| l.track.duration_s()).unwrap_or(0.0);
-        let pos = self.player.position_s();
-        let mut exit = false;
-        egui::Area::new(egui::Id::new("fs_bar")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -28.0]).show(ctx, |ui| {
+        if active { ctx.request_repaint_after(Duration::from_millis(300)); } else { return None; }
+        let dur = self.total_duration_s();
+        let pos = self.global_pos_s();
+        let mut act = None;
+        egui::Area::new(egui::Id::new("hidden_ui_bar")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -28.0]).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button(if self.player.is_playing() { "\u{23F8}" } else { "\u{25B6}" }).clicked() { self.player.toggle(); }
+                    if ui.button(if self.player.is_playing() { "Pause" } else { "Play" }).clicked() { self.player.toggle(); }
                     ui.monospace(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
                     ui.spacing_mut().slider_width = 360.0;
                     let mut p = pos;
-                    if dur > 0.0 && ui.add(egui::Slider::new(&mut p, 0.0..=dur).show_value(false)).changed() { self.player.seek(p); }
-                    if ui.button("Exit fullscreen (F11)").clicked() { exit = true; }
+                    if dur > 0.0 && ui.add(egui::Slider::new(&mut p, 0.0..=dur).show_value(false)).changed() { self.seek_global(ctx, p); }
+                    if ui.button("Show panels (Tab)").clicked() { act = Some(OverlayAct::ShowPanels); }
+                    if fullscreen && ui.button("Exit fullscreen (F11)").clicked() { act = Some(OverlayAct::ExitFullscreen); }
                 });
             });
         });
-        exit
+        act
     }
+
+    pub fn is_playing(&self) -> bool { self.player.is_playing() }
 
     /// True while a file owns the title/cover (the app should ignore system media-session updates).
     pub fn owns_track_info(&self) -> bool { self.selected.is_some() }
@@ -515,7 +588,7 @@ impl Studio {
     fn spawn_probe(&self, ctx: &egui::Context, id: u64, path: PathBuf) {
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let res = decode::probe_file(&path).map_err(|e| e.to_string());
+            let res = probe_with_duration(&path);
             let _ = tx.send(Msg::Probed { id, res });
             ctx2.request_repaint();
         });
@@ -533,7 +606,7 @@ impl Studio {
             self.next_id += 1;
             let exists = path.is_file();
             fresh.push(Entry { id, path: path.clone(), meta: TrackMeta::default(), duration: None,
-                status: if exists { Status::Pending } else { Status::Failed("File is missing \u{2013} use File \u{2192} Missing files".into()) } });
+                status: if exists { Status::Pending } else { Status::Failed("File is missing - use File > Missing files".into()) } });
             if exists { self.spawn_probe(ctx, id, path); }
         }
         let selected_gone = self.selected.map(|s| old.iter().any(|e| e.id == s)).unwrap_or(false);

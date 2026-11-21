@@ -2,6 +2,7 @@
 
 mod app_mode;
 mod compose;
+mod fonts;
 mod fxtrack;
 mod layers_ui;
 mod overlay;
@@ -10,7 +11,9 @@ mod reactive;
 mod render;
 mod render_ui;
 mod studio;
+mod textshape;
 mod timeline;
+mod ui_util;
 mod video;
 
 use crate::render::Host; // brings `draw_scene` into scope
@@ -875,6 +878,31 @@ struct VisualizerApp {
     config_changed_flag: bool,
     project: project_state::ProjectState,
     layers_ui: layers_ui::LayersUi,
+
+    // ── studio layout / theme / preview cache ──
+    sidebar_tab: SidebarTab,
+    ui_hidden: bool,
+    themed: Option<bool>,
+    overlay_style: Option<Arc<egui::Style>>,
+    preview_key: Option<PreviewKey>,
+    preview_settle: std::time::Instant,
+    last_layers: Vec<project::Layer>,
+    last_settings: Option<visualizer_core::export::RenderSettings>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab { Audio, Layers, View }
+
+/// Everything that can change the preview picture; if it is unchanged the cached picture is reused.
+#[derive(Clone, PartialEq)]
+struct PreviewKey {
+    px: [u32; 2],
+    canvas: (u32, u32),
+    file_active: bool,
+    t_bits: u32,
+    live: u32,
+    cfg_gen: u64,
+    track: u64,
 }
 
 impl VisualizerApp {
@@ -1066,6 +1094,14 @@ impl VisualizerApp {
             config_changed_flag: false,
             project,
             layers_ui: layers_ui::LayersUi::new(),
+            sidebar_tab: SidebarTab::Audio,
+            ui_hidden: false,
+            themed: None,
+            overlay_style: None,
+            preview_key: None,
+            preview_settle: std::time::Instant::now(),
+            last_layers: Vec::new(),
+            last_settings: None,
         }
     }
 
@@ -1384,6 +1420,10 @@ impl VisualizerApp {
             }
         }
 
+        let mut info = info;
+        info.title = textshape::shape(&info.title).into_owned();
+        info.artist = textshape::shape(&info.artist).into_owned();
+        info.album = textshape::shape(&info.album).into_owned();
         if info.title.is_empty() && info.artist.is_empty() {
             self.track_info = None;
         } else {
@@ -5372,8 +5412,10 @@ impl VisualizerApp {
 // ═══════════════════════════════════════════════════════════════
 
 /// Font definitions for the track-info text (shared by the UI context and every offscreen job).
+/// System fallback fonts are appended so CJK / Arabic / Hebrew / Indic / Thai titles show real glyphs.
 fn font_defs(path: &Option<String>) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
+    fonts::install_fallbacks(&mut fonts);
     let mut names: Vec<String> = Vec::new();
     if let Some(p) = path {
         if let Ok(data) = std::fs::read(p) {
@@ -5381,11 +5423,8 @@ fn font_defs(path: &Option<String>) -> egui::FontDefinitions {
             names.push(CUSTOM_FONT_KEY.to_owned());
         }
     }
-    if names.is_empty() {
-        if let Some(d) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
-            names = d;
-        }
-    }
+    // the custom family always falls back to the same fonts as the UI
+    if let Some(d) = fonts.families.get(&egui::FontFamily::Proportional).cloned() { names.extend(d); }
     fonts.families.insert(custom_font_family(), names);
     fonts
 }
@@ -5452,19 +5491,27 @@ fn draw_checkerboard(p: &egui::Painter, r: egui::Rect) {
     }
 }
 
+const GUIDE_TITLE: egui::Color32 = egui::Color32::from_rgb(0, 220, 255);
+const GUIDE_ACTION: egui::Color32 = egui::Color32::from_rgb(255, 200, 0);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(150, 100, 255);
+
 fn draw_guides(p: &egui::Painter, r: egui::Rect, aspect: f32) {
-    let title_safe = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 255, 255, 140));
-    let action_safe = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 140));
-    p.rect_stroke(egui::Rect::from_center_size(r.center(), r.size() * 0.95), 0.0, action_safe);
-    p.rect_stroke(egui::Rect::from_center_size(r.center(), r.size() * 0.90), 0.0, title_safe);
-    let thin = egui::Stroke::new(0.5_f32, title_safe.color);
+    let action = egui::Rect::from_center_size(r.center(), r.size() * 0.95);
+    let title = egui::Rect::from_center_size(r.center(), r.size() * 0.90);
+    p.rect_stroke(action, 0.0, egui::Stroke::new(1.0_f32, GUIDE_ACTION.gamma_multiply(0.8)));
+    p.rect_stroke(title, 0.0, egui::Stroke::new(1.0_f32, GUIDE_TITLE.gamma_multiply(0.8)));
+    let thin = egui::Stroke::new(0.5_f32, GUIDE_TITLE.gamma_multiply(0.5));
     p.line_segment([egui::pos2(r.center().x, r.top()), egui::pos2(r.center().x, r.bottom())], thin);
     p.line_segment([egui::pos2(r.left(), r.center().y), egui::pos2(r.right(), r.center().y)], thin);
+    let font = egui::FontId::monospace(10.0);
+    p.text(title.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, "TITLE SAFE 90% - keep text inside", font.clone(), GUIDE_TITLE);
+    p.text(action.right_bottom() - egui::vec2(4.0, 2.0), egui::Align2::RIGHT_BOTTOM, "ACTION SAFE 95% - keep key visuals inside", font, GUIDE_ACTION);
     if aspect < 0.7 {
         // vertical formats: typical Shorts / Reels / TikTok interface zones
-        let red = egui::Color32::from_rgba_unmultiplied(255, 60, 60, 40);
+        let red = egui::Color32::from_rgba_unmultiplied(255, 60, 60, 45);
         p.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), r.height() * 0.12)), 0.0, red);
         p.rect_filled(egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - r.height() * 0.22), r.max), 0.0, red);
+        p.text(r.left_top() + egui::vec2(4.0, r.height() * 0.12 - 12.0), egui::Align2::LEFT_TOP, "app UI zone", egui::FontId::monospace(9.0), egui::Color32::from_rgb(255, 120, 120));
     }
 }
 
@@ -5550,101 +5597,314 @@ impl VisualizerApp {
         self.offscreen = Some(off);
     }
 
-    /// Preview through the same offscreen path as export. Returns false when there is no GL context.
-    fn render_preview(&mut self, ctx: &egui::Context, gl: Option<&Arc<glow::Context>>, area: egui::Rect, painter: &egui::Painter) -> bool {
-        let Some(mut off) = self.take_offscreen(gl) else { return false };
-        let s = self.render_ui.settings.clone();
-        let aspect = s.width as f32 / s.height as f32;
-        let mut size = area.size();
-        if size.x / size.y > aspect { size.x = size.y * aspect } else { size.y = size.x / aspect }
-        let fit = egui::Rect::from_center_size(area.center(), size);
-        let ppp = ctx.pixels_per_point();
-        let px = [(size.x * ppp).round().max(2.0) as u32, (size.y * ppp).round().max(2.0) as u32];
-        // cap the synchronous GPU readback; the texture is scaled up on screen
-        let k = (1600.0 / px[0].max(px[1]) as f32).min(1.0);
-        let px = [((px[0] as f32 * k).round() as u32).max(2), ((px[1] as f32 * k).round() as u32).max(2)];
+    /// Black studio theme + slightly larger text while in Window / Fullscreen; the overlay keeps its own style.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let want = self.mode != app_mode::WindowMode::Overlay;
+        if self.themed == Some(want) { return; }
+        if want {
+            if self.overlay_style.is_none() { self.overlay_style = Some(ctx.style()); }
+            let mut st = (*ctx.style()).clone();
+            let g = egui::Color32::from_gray;
+            let v = &mut st.visuals;
+            v.dark_mode = true;
+            v.panel_fill = egui::Color32::BLACK;
+            v.window_fill = g(6);
+            v.extreme_bg_color = egui::Color32::BLACK;
+            v.faint_bg_color = g(10);
+            v.window_stroke = egui::Stroke::new(1.0_f32, g(55));
+            v.widgets.noninteractive.bg_fill = egui::Color32::BLACK;
+            v.widgets.noninteractive.weak_bg_fill = egui::Color32::BLACK;
+            v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, g(40));
+            v.widgets.inactive.bg_fill = g(24);
+            v.widgets.inactive.weak_bg_fill = g(24);
+            v.widgets.hovered.bg_fill = g(44);
+            v.widgets.hovered.weak_bg_fill = g(44);
+            v.widgets.active.bg_fill = g(64);
+            v.widgets.active.weak_bg_fill = g(64);
+            v.selection.bg_fill = egui::Color32::from_rgb(88, 58, 170);
+            for (_, f) in st.text_styles.iter_mut() { f.size = (f.size * 1.18).round(); }
+            ctx.set_style(st);
+        } else if let Some(prev) = self.overlay_style.take() {
+            ctx.set_style(prev);
+        }
+        self.themed = Some(want);
+    }
 
-        let file_t = self.studio.position_s();
-        let file_frame = self.studio.frame_for(&self.config, file_t);
-        let t = if file_frame.is_some() { file_t as f64 } else { ctx.input(|i| i.time) };
-        let dur = self.studio.duration_s() as f64;
-        let track_len = if dur > 0.0 { dur } else { 1.0e9 };
-        let layers = self.project.doc.layers.clone();
-        let dir = self.project.dir();
-
-        let mut comp = self.preview_comp.take()
-            .unwrap_or_else(|| compose::Compositor::new(compose::Mode::Preview, None, s.fps, 960, s.hw_decode));
-        if comp.ffmpeg.is_none() { comp.ffmpeg = self.render_ui.ffmpeg_path(); }
-        comp.set_fps(s.fps);
-        comp.set_hwdec(s.hw_decode);
-        comp.prepare(&layers, t, track_len, &dir);
-
-        let params = render::Params::for_settings(&s, px, t as f32);
-        let meta = if file_frame.is_some() { self.studio.selected_meta().cloned() } else { None };
-        let cover = self.cover_color_image.clone();
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            format!("{:?}", self.track_id).hash(&mut h);
-            h.finish()
-        };
-        let (fr, fxs) = match &file_frame { Some((f, x)) => (Some(f), Some(x)), None => (None, None) };
-        let res = self.draw_scene(&mut off, render::FrameInput {
-            main_ctx: ctx, cfg: None, frame: fr, fx: fxs, layers: &layers, comp: &mut comp, t, track_len,
-            project_dir: &dir, palettes: None, meta: meta.as_ref(), cover_key: key, cover: cover.as_ref(),
-            params: &params, bg: (!s.transparent).then_some(s.background),
-        });
-        let ok = res.is_ok();
-        if let Err(e) = res { self.note(e); }
-        self.preview_comp = Some(comp);
-
-        if ok {
-            let img = render::to_color_image(&off.read_sync(), px[0] as usize, px[1] as usize);
-            match &mut self.preview_tex {
-                Some(tx) => tx.set(img, egui::TextureOptions::LINEAR),
-                None => self.preview_tex = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+    /// Dropped files: audio -> track list, image / video -> new layer. Also paints a hint while hovering.
+    fn handle_dropped(&mut self, ctx: &egui::Context) {
+        let files: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !files.is_empty() {
+            let dir = self.project.dir_opt();
+            let mut audio = Vec::new();
+            for p in files {
+                if layers_ui::media_kind(&p).is_some() {
+                    self.layers_ui.add_media(&mut self.project.doc, &p, dir.as_deref());
+                    self.sidebar_tab = SidebarTab::Layers;
+                } else { audio.push(p); }
             }
-            if s.transparent { draw_checkerboard(painter, fit); }
+            if !audio.is_empty() { self.studio.add_files(ctx, audio); self.sidebar_tab = SidebarTab::Audio; }
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
+            let r = ctx.screen_rect();
+            p.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
+            p.rect_stroke(r.shrink(14.0), 8.0, egui::Stroke::new(3.0_f32, ACCENT));
+            p.text(r.center(), egui::Align2::CENTER_CENTER, "Drop audio, image or video files to add them", egui::FontId::proportional(24.0), egui::Color32::WHITE);
+        }
+    }
+
+    /// The single left sidebar: Audio / Layers / View tabs. Rows are clipped so long names never widen it,
+    /// and its width can always be dragged.
+    fn ui_sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("sidebar").resizable(true).default_width(340.0).width_range(220.0..=900.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                for (tab, label) in [(SidebarTab::Audio, "Audio"), (SidebarTab::Layers, "Layers"), (SidebarTab::View, "View")] {
+                    ui.selectable_value(&mut self.sidebar_tab, tab, egui::RichText::new(label).strong());
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                match self.sidebar_tab {
+                    SidebarTab::Audio => {
+                        let mut seq = self.render_ui.settings.sequence;
+                        self.studio.ui_audio(ui, ctx, &mut seq);
+                        self.render_ui.settings.sequence = seq;
+                    }
+                    SidebarTab::Layers => {
+                        let pos = self.studio.global_pos_s() as f64;
+                        let dir_opt = self.project.dir_opt();
+                        self.layers_ui.ui_panel(ui, &mut self.project.doc, dir_opt.as_deref(), pos);
+                    }
+                    SidebarTab::View => self.ui_view_tab(ui),
+                }
+            });
+        });
+    }
+
+    fn ui_view_tab(&mut self, ui: &mut egui::Ui) {
+        use visualizer_core::export::PreviewAspect;
+        ui.heading("Preview canvas");
+        ui.small("The shape of the preview. It is independent of the export size, so you can work in any shape you like.");
+        let width = (ui.available_width() - 8.0).max(120.0);
+        let (ew, eh) = (self.render_ui.settings.width, self.render_ui.settings.height);
+        {
+            let s = &mut self.render_ui.settings;
+            let cur = s.preview;
+            egui::ComboBox::from_id_source("preview_aspect").width(width).selected_text(cur.label()).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.preview, PreviewAspect::MatchExport, "Same as export");
+                ui.selectable_value(&mut s.preview, PreviewAspect::FitWindow, "Fill the window");
+                for (name, a) in PreviewAspect::PRESETS { ui.selectable_value(&mut s.preview, a, name); }
+            });
+            let (mut cw, mut chh) = match s.preview { PreviewAspect::Ratio(w, h) => (w, h), _ => (16, 9) };
+            ui.horizontal(|ui| {
+                ui.label("Custom ratio");
+                let a = ui.add(egui::DragValue::new(&mut cw).clamp_range(1..=64));
+                ui.label(":");
+                let b = ui.add(egui::DragValue::new(&mut chh).clamp_range(1..=64));
+                if a.changed() || b.changed() { s.preview = PreviewAspect::Ratio(cw, chh); }
+            });
+            // does the preview show what the export will contain?
+            let export_aspect = ew as f32 / eh as f32;
+            let prev_aspect = match s.preview { PreviewAspect::Ratio(w, h) => Some(w as f32 / h as f32), PreviewAspect::MatchExport => Some(export_aspect), PreviewAspect::FitWindow => None };
+            let differs = match prev_aspect { Some(p) => (p / export_aspect - 1.0).abs() > 0.01, None => true };
+            if differs {
+                ui.colored_label(egui::Color32::from_rgb(240, 190, 80),
+                    format!("The preview shape differs from the export ({ew}x{eh}). The video is composed for its own shape, so layout (bar positions, text, backgrounds) can look different in the file."));
+                if ui.button("Make the preview match the export").clicked() { s.preview = PreviewAspect::MatchExport; }
+            }
+        }
+
+        ui.separator();
+        ui.heading("Safe-area guides");
+        ui.checkbox(&mut self.render_ui.show_guides, "Show guides on the preview");
+        ui.small("Guides are drawn on the preview only; they are never part of the exported video.");
+        ui.colored_label(GUIDE_TITLE, "Blue frame = title safe (90%)");
+        ui.small("Keep text, logos and song titles inside it. Many TVs, players and phone apps crop or cover the outer edge of a video, so anything outside this frame can be cut off.");
+        ui.colored_label(GUIDE_ACTION, "Yellow frame = action safe (95%)");
+        ui.small("Keep the important picture (bars, artwork, faces) inside it. Only backgrounds and decoration should reach the very edge.");
+        ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "Red bands (vertical canvases only)");
+        ui.small("Where Shorts / Reels / TikTok draw their own buttons and captions: the top 12% and bottom 22%. Keep text out of them.");
+        ui.small("The thin cross marks the exact centre.");
+
+        ui.separator();
+        ui.heading("Window");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Hide panels (Tab)").clicked() { self.ui_hidden = true; }
+            if ui.button("Fullscreen (F11)").clicked() {
+                let to = if self.mode == app_mode::WindowMode::Fullscreen { app_mode::WindowMode::Window } else { app_mode::WindowMode::Fullscreen };
+                lock_state(&self.shared).requested_mode = Some(to);
+            }
+        });
+    }
+
+    /// Preview through the same offscreen path as export, on its own canvas shape. The picture is only
+    /// re-rendered when something changed (playback, scrubbing, settings, layers, live audio, resizing);
+    /// otherwise the cached texture is painted again, so an idle app costs almost nothing.
+    fn render_preview(&mut self, ctx: &egui::Context, gl: Option<&Arc<glow::Context>>, area: egui::Rect, painter: &egui::Painter) -> bool {
+        use visualizer_core::export::PreviewAspect;
+        let (ew, eh, fps, hw_decode, transparent, bgc, pa) = {
+            let s = &self.render_ui.settings;
+            (s.width, s.height, s.fps, s.hw_decode, s.transparent, s.background, s.preview)
+        };
+        let ppp = ctx.pixels_per_point();
+
+        // 1. canvas shape -> exact on-screen pixel rectangle (no resampling blur: size and position are whole pixels)
+        let avail = area.size();
+        let (cw0, ch0) = pa.canvas((ew, eh), (avail.x * ppp, avail.y * ppp));
+        let aspect = cw0 / ch0;
+        let (mut w, mut h) = (avail.x, avail.x / aspect);
+        if h > avail.y { h = avail.y; w = h * aspect; }
+        let (pw, ph) = ((w * ppp).floor().max(2.0), (h * ppp).floor().max(2.0));
+        let size = egui::vec2(pw / ppp, ph / ppp);
+        let min = egui::pos2(((area.center().x - size.x / 2.0) * ppp).round() / ppp, ((area.center().y - size.y / 2.0) * ppp).round() / ppp);
+        let fit = egui::Rect::from_min_size(min, size);
+        let (cw, ch) = if pa == PreviewAspect::FitWindow { (pw, ph) } else { (cw0, ch0) };
+        let mut px = [pw as u32, ph as u32];
+        let mut smooth = false;
+        let m = px[0].max(px[1]) as f32;
+        if m > 2560.0 { let k = 2560.0 / m; px = [((px[0] as f32 * k).round() as u32).max(2), ((px[1] as f32 * k).round() as u32).max(2)]; smooth = true; }
+
+        // 2. did anything change since the last picture?
+        let file_active = self.studio.is_active();
+        let gpos = self.studio.global_pos_s();
+        let live_energy = if file_active { 0.0 } else { self.current_bars.iter().fold(0.0f32, |a, &b| a.max(b)) };
+        let key = PreviewKey { px, canvas: (cw.round() as u32, ch.round() as u32), file_active, t_bits: gpos.to_bits(),
+                               live: (live_energy * 4000.0) as u32, cfg_gen: self.seen_gen, track: self.track_id };
+        let layers_changed = self.project.doc.layers != self.last_layers;
+        let settings_changed = self.last_settings.as_ref() != Some(&self.render_ui.settings);
+        let changed = self.preview_tex.is_none() || self.preview_key.as_ref() != Some(&key) || layers_changed || settings_changed;
+        let now = std::time::Instant::now();
+        if changed { self.preview_settle = now + Duration::from_millis(900); } // let async things (video frames, fonts) arrive
+        let busy = self.studio.is_playing() || live_energy > 0.002 || now < self.preview_settle;
+        if now < self.preview_settle { ctx.request_repaint_after(Duration::from_millis(30)); }
+
+        let mut ok = self.preview_tex.is_some();
+        if changed || busy {
+            let Some(mut off) = self.take_offscreen(gl) else { return false };
+            let file_t = self.studio.position_s();
+            let file_frame = self.studio.frame_for(&self.config, file_t);
+            let t = if file_frame.is_some() { gpos as f64 } else { ctx.input(|i| i.time) };
+            let dur = self.studio.total_duration_s() as f64;
+            let track_len = if dur > 0.0 { dur } else { 1.0e9 };
+            let layers = self.project.doc.layers.clone();
+            let dir = self.project.dir();
+
+            let mut comp = self.preview_comp.take()
+                .unwrap_or_else(|| compose::Compositor::new(compose::Mode::Preview, None, fps, 960, hw_decode));
+            if comp.ffmpeg.is_none() { comp.ffmpeg = self.render_ui.ffmpeg_path(); }
+            comp.set_fps(fps);
+            comp.set_hwdec(hw_decode);
+            comp.prepare(&layers, t, track_len, &dir);
+
+            let params = render::Params::for_canvas(cw, ch, px, t as f32);
+            let meta = if file_frame.is_some() { self.studio.selected_meta().cloned() } else { None };
+            let cover = self.cover_color_image.clone();
+            let ckey = {
+                use std::hash::{Hash, Hasher};
+                let mut hs = std::collections::hash_map::DefaultHasher::new();
+                format!("{:?}", self.track_id).hash(&mut hs);
+                hs.finish()
+            };
+            let (fr, fxs) = match &file_frame { Some((f, x)) => (Some(f), Some(x)), None => (None, None) };
+            let res = self.draw_scene(&mut off, render::FrameInput {
+                main_ctx: ctx, cfg: None, frame: fr, fx: fxs, layers: &layers, comp: &mut comp, t, track_len,
+                project_dir: &dir, palettes: None, meta: meta.as_ref(), cover_key: ckey, cover: cover.as_ref(),
+                params: &params, bg: (!transparent).then_some(bgc),
+            });
+            ok = res.is_ok();
+            if let Err(e) = res { self.note(e); }
+            self.preview_comp = Some(comp);
+
+            if ok {
+                let img = render::to_color_image(&off.read_sync(), px[0] as usize, px[1] as usize);
+                let opts = if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
+                match &mut self.preview_tex {
+                    Some(tx) => tx.set(img, opts),
+                    None => self.preview_tex = Some(ctx.load_texture("preview", img, opts)),
+                }
+                self.preview_key = Some(key);
+                if layers_changed || self.last_layers.is_empty() { self.last_layers = layers; }
+                if settings_changed || self.last_settings.is_none() { self.last_settings = Some(self.render_ui.settings.clone()); }
+            }
+            self.offscreen = Some(off);
+        }
+
+        // 3. paint the (cached) picture, the accent frame and the optional guides
+        if ok {
+            if transparent { draw_checkerboard(painter, fit); }
             if let Some(tex) = &self.preview_tex {
                 painter.image(tex.id(), fit, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             }
-            if self.render_ui.show_guides { draw_guides(painter, fit, aspect); }
+            painter.rect_stroke(fit.expand(2.0), 0.0, egui::Stroke::new(2.0_f32, ACCENT));
+            if self.render_ui.show_guides { draw_guides(painter, fit, cw / ch); }
         }
-        self.offscreen = Some(off);
         ok
     }
 
     /// One frame in Window / Fullscreen mode (the overlay path is untouched).
     fn update_windowed(&mut self, ctx: &egui::Context, gl: Option<Arc<glow::Context>>) {
         if self.mode == app_mode::WindowMode::Window { self.win_prefs.remember(ctx); }
+        self.handle_dropped(ctx);
         self.studio.handle_input(ctx);
+        self.studio.sequence = self.render_ui.settings.sequence;
         self.studio.poll(ctx, &self.config);
         self.studio.fps = self.render_ui.settings.fps; // analysis rate follows the export frame rate
+
+        // keyboard: Ctrl+R render panel, Tab hide/show panels, [ and ] trim the selected layer at the playhead
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers { command: true, ..egui::Modifiers::NONE }, egui::Key::R)) {
             self.render_ui.open ^= true;
         }
+        if !ctx.wants_keyboard_input() {
+            let (tab, lb, rb) = ctx.input_mut(|i| (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)));
+            if tab { self.ui_hidden = !self.ui_hidden; }
+            if lb || rb {
+                if let Some(id) = self.layers_ui.selected {
+                    let p = self.studio.global_pos_s() as f64;
+                    if let Some(l) = self.project.doc.layers.iter_mut().find(|l| l.id == id && !l.locked) {
+                        if lb { l.start_s = p.min(l.end_s.unwrap_or(f64::MAX) - 0.1).max(0.0); }
+                        else { l.end_s = Some(p.max(l.start_s + 0.1)); }
+                    }
+                }
+            }
+        }
 
-        if self.mode == app_mode::WindowMode::Window {
+        if !self.ui_hidden {
             let progress = self.queue.jobs.iter().find(|j| j.is_active()).map(|j| j.progress).unwrap_or(0.0);
             let note = format!("rendering {}%", (progress * 100.0) as u32);
             let out = self.project.ui(ctx, self.queue.busy(), &note); // menu bar, dialogs, autosave, shortcuts
             if out.toggle_render { self.render_ui.open ^= true; }
+            if out.toggle_ui_hidden { self.ui_hidden = true; }
+            if out.toggle_fullscreen {
+                let to = if self.mode == app_mode::WindowMode::Fullscreen { app_mode::WindowMode::Window } else { app_mode::WindowMode::Fullscreen };
+                lock_state(&self.shared).requested_mode = Some(to);
+            }
             if out.toggle_settings {
                 let v = self.settings_open.load(Ordering::Relaxed);
                 self.settings_open.store(!v, Ordering::Relaxed);
             }
             if let Some(doc) = out.apply { self.apply_doc(ctx, &doc); }
 
-            self.studio.ui_left(ctx);
-            self.studio.ui_bottom(ctx, &mut self.render_ui.settings.range, &mut self.project.doc.layers, &mut self.layers_ui.selected);
-            let pos = self.studio.position_s() as f64;
             let dir_opt = self.project.dir_opt();
-            self.layers_ui.ui(ctx, &mut self.project.doc, dir_opt.as_deref(), pos);
-            let (layers, dir) = (self.project.doc.layers.clone(), self.project.dir());
-            let extra = compose::layer_issues(&layers, &dir, self.render_ui.ffmpeg_path().is_some());
-            self.render_ui.ui(ctx, &self.studio, &self.config, &mut self.queue, &layers, &dir, &extra);
-        } else if self.studio.ui_fullscreen_overlay(ctx) {
-            self.set_mode(ctx, app_mode::WindowMode::Window);
+            self.layers_ui.poll(&mut self.project.doc, dir_opt.as_deref());
+            self.ui_sidebar(ctx);
+            self.studio.ui_bottom(ctx, &mut self.render_ui.settings.range, &mut self.project.doc.layers, &mut self.layers_ui.selected);
+            if self.render_ui.open {
+                let (layers, dir) = (self.project.doc.layers.clone(), self.project.dir());
+                let extra = compose::layer_issues(&layers, &dir, self.render_ui.ffmpeg_path().is_some());
+                self.render_ui.ui(ctx, &self.studio, &self.config, &mut self.queue, &layers, &dir, &extra);
+            } else {
+                self.render_ui.ui(ctx, &self.studio, &self.config, &mut self.queue, &[], std::path::Path::new(""), &[]);
+            }
+        } else {
+            match self.studio.ui_overlay(ctx, self.mode == app_mode::WindowMode::Fullscreen) {
+                Some(studio::OverlayAct::ShowPanels) => self.ui_hidden = false,
+                Some(studio::OverlayAct::ExitFullscreen) => self.set_mode(ctx, app_mode::WindowMode::Window),
+                None => {}
+            }
         }
 
         // Record undo steps / dirty state once per frame, after every panel had its say.
@@ -5657,9 +5917,8 @@ impl VisualizerApp {
         // The CentralPanel must come AFTER every side/top/bottom panel: it fills what is left and,
         // being part of the same layer, never covers them.
         let screen = ctx.screen_rect();
-        let bg = self.config.bg_color;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(bg[0], bg[1], bg[2])))
+            .frame(egui::Frame::none().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let canvas = ui.max_rect();
                 let painter = ui.painter().clone();
@@ -5694,7 +5953,7 @@ impl render::Host for VisualizerApp {
         off.sync_cover(cover_key, cover);
 
         if let (Some(f), Some(x)) = (frame, fx) { self.apply_file_frame(f, x.clone()); } // None = keep the live bars
-        let info = meta.map(|m| TrackInfo { title: m.title.clone(), artist: m.artist.clone(), album: m.album.clone(), cover_art: None });
+        let info = meta.map(|m| TrackInfo { title: textshape::shape(&m.title).into_owned(), artist: textshape::shape(&m.artist).into_owned(), album: textshape::shape(&m.album).into_owned(), cover_art: None });
         let saved_info = if meta.is_some() { Some(std::mem::replace(&mut self.track_info, info)) } else { None };
         let saved_cover = if cover.is_some() || meta.is_some() { Some(self.cover_texture.take()) } else { None };
 
@@ -5772,6 +6031,7 @@ impl eframe::App for VisualizerApp {
         }
         self.pump_render(ctx, gl.as_ref());
         self.monitor_watch.poll(ctx, self.mode);
+        self.apply_theme(ctx);
 
         let generation = self.config_gen.load(Ordering::Acquire);
         if generation != self.seen_gen {

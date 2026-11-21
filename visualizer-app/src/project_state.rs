@@ -33,6 +33,8 @@ pub struct UiOut {
     pub apply: Option<ProjectDoc>,
     pub toggle_render: bool,
     pub toggle_settings: bool,
+    pub toggle_ui_hidden: bool,
+    pub toggle_fullscreen: bool,
 }
 
 pub struct ProjectState {
@@ -255,7 +257,7 @@ impl ProjectState {
             if let Some(p) = m.resolve(&dir) { if seen.insert(p.clone()) { files.push(p); } }
         }
         let tx = self.tx.clone();
-        self.say("Copying media\u{2026}");
+        self.say("Copying media...");
         let _ = path;
         std::thread::spawn(move || {
             let r = (|| -> Result<Vec<(PathBuf, PathBuf)>, String> {
@@ -301,7 +303,7 @@ impl ProjectState {
     // ── UI ──────────────────────────────────────────────────
 
     pub fn ui(&mut self, ctx: &egui::Context, render_busy: bool, queue_note: &str) -> UiOut {
-        let mut out = UiOut { apply: None, toggle_render: false, toggle_settings: false };
+        let mut out = UiOut { apply: None, toggle_render: false, toggle_settings: false, toggle_ui_hidden: false, toggle_fullscreen: false };
         while let Ok(d) = self.rx.try_recv() { self.handle(ctx, d); }
 
         // window close with unsaved work
@@ -329,7 +331,7 @@ impl ProjectState {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New          Ctrl+N").clicked() { self.guarded(ctx, Pending::New); ui.close_menu(); }
-                    if ui.button("Open\u{2026}      Ctrl+O").clicked() { self.open_dialog(); ui.close_menu(); }
+                    if ui.button("Open...      Ctrl+O").clicked() { self.open_dialog(); ui.close_menu(); }
                     ui.menu_button("Open recent", |ui| {
                         if self.recent.is_empty() { ui.label("(none)"); }
                         for r in self.recent.clone() {
@@ -340,17 +342,17 @@ impl ProjectState {
                     });
                     ui.separator();
                     if ui.button("Save          Ctrl+S").clicked() { self.save(); ui.close_menu(); }
-                    if ui.button("Save as\u{2026}   Ctrl+Shift+S").clicked() { self.save_as_dialog(); ui.close_menu(); }
+                    if ui.button("Save as...   Ctrl+Shift+S").clicked() { self.save_as_dialog(); ui.close_menu(); }
                     ui.separator();
                     if ui.button("Collect files next to project").on_hover_text("Copies audio, images and videos into <project>_media so the project can be moved").clicked() { self.collect_files(); ui.close_menu(); }
-                    if ui.button("Missing files\u{2026}").clicked() { self.show_missing = true; ui.close_menu(); }
+                    if ui.button("Missing files...").clicked() { self.show_missing = true; ui.close_menu(); }
                     ui.separator();
-                    if ui.button("Save preset\u{2026}").on_hover_text("Visualizer look + render settings + layers, without audio").clicked() {
+                    if ui.button("Save preset...").on_hover_text("Visualizer look + render settings + layers, without audio").clicked() {
                         let (tx, dir) = (self.tx.clone(), self.dir());
                         std::thread::spawn(move || { if let Some(p) = rfd::FileDialog::new().add_filter("SABI preset", &["sabipreset"]).set_directory(dir).save_file() { let _ = tx.send(Done::SavePreset(p.with_extension("sabipreset"))); } });
                         ui.close_menu();
                     }
-                    if ui.button("Load preset\u{2026}").clicked() {
+                    if ui.button("Load preset...").clicked() {
                         let (tx, dir) = (self.tx.clone(), self.dir());
                         std::thread::spawn(move || { if let Some(p) = rfd::FileDialog::new().add_filter("SABI preset", &["sabipreset"]).set_directory(dir).pick_file() { let _ = tx.send(Done::LoadPreset(p)); } });
                         ui.close_menu();
@@ -360,18 +362,22 @@ impl ProjectState {
                     if ui.add_enabled(self.undo.can_undo(), egui::Button::new("Undo      Ctrl+Z")).clicked() { if let Some(d) = self.undo() { self.queued_apply = Some(d); } ui.close_menu(); }
                     if ui.add_enabled(self.undo.can_redo(), egui::Button::new("Redo      Ctrl+Y")).clicked() { if let Some(d) = self.redo() { self.queued_apply = Some(d); } ui.close_menu(); }
                 });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Hide panels   Tab").on_hover_text("Show only the preview. Move the mouse to bring a small control bar back.").clicked() { out.toggle_ui_hidden = true; ui.close_menu(); }
+                    if ui.button("Fullscreen   F11").clicked() { out.toggle_fullscreen = true; ui.close_menu(); }
+                });
                 ui.separator();
-                if ui.button("Render\u{2026}  Ctrl+R").clicked() { out.toggle_render = true; }
+                if ui.button("Render...  Ctrl+R").clicked() { out.toggle_render = true; }
                 if ui.button("Settings").clicked() { out.toggle_settings = true; }
-                if render_busy { ui.label(format!("\u{23F3} {queue_note}")); }
+                if render_busy { ui.label(format!("{queue_note}")); }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{}{}", if self.dirty { "\u{25CF} " } else { "" }, self.path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("Untitled project")));
+                    ui.label(format!("{}{}", if self.dirty { "* " } else { "" }, self.path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("Untitled project")));
                 });
             });
         });
 
         // window title
-        let title = format!("{}{} \u{2013} SABI NEIRO", if self.dirty { "\u{25CF} " } else { "" }, if self.doc.name.is_empty() { "Untitled" } else { &self.doc.name });
+        let title = format!("{}{} - SABI NEIRO", if self.dirty { "* " } else { "" }, if self.doc.name.is_empty() { "Untitled" } else { &self.doc.name });
         if self.last_title.as_deref() != Some(title.as_str()) { ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone())); self.last_title = Some(title); }
 
         self.dialogs(ctx);
@@ -443,13 +449,13 @@ impl ProjectState {
                 for old in &missing {
                     ui.horizontal(|ui| {
                         ui.small(old.display().to_string());
-                        if ui.small_button("Locate\u{2026}").clicked() {
+                        if ui.small_button("Locate...").clicked() {
                             let (tx, o) = (self.tx.clone(), old.clone());
                             std::thread::spawn(move || { if let Some(n) = rfd::FileDialog::new().set_file_name(o.file_name().and_then(|n| n.to_str()).unwrap_or("")).pick_file() { let _ = tx.send(Done::Locate(o, n)); } });
                         }
                     });
                 }
-                if ui.button("Search a folder\u{2026}").clicked() {
+                if ui.button("Search a folder...").clicked() {
                     let tx = self.tx.clone();
                     std::thread::spawn(move || { if let Some(d) = rfd::FileDialog::new().pick_folder() { let _ = tx.send(Done::SearchFolder(d)); } });
                 }

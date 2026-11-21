@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use glow::HasContext;
 use visualizer_core::audio::offline::{self, analysis_rate_for_fps, AnalysisTrack};
-use visualizer_core::config::AppConfig;
+use visualizer_core::config::{AppConfig, AudioSettings};
 use visualizer_core::decode::{self, TrackMeta};
 use visualizer_core::export::{self as ex, RenderSettings};
 use visualizer_core::project::Layer;
@@ -38,6 +38,11 @@ pub struct Params {
     pub time: f32,
 }
 impl Params {
+    /// Any canvas size in pixels (only its proportions matter; the short side maps to 1080 points).
+    pub fn for_canvas(cw: f32, ch: f32, px: [u32; 2], time: f32) -> Self {
+        let sc = (cw.min(ch).max(1.0)) / 1080.0;
+        Self { px, logical: egui::vec2(cw / sc, ch / sc), time }
+    }
     pub fn for_settings(s: &RenderSettings, px: [u32; 2], time: f32) -> Self {
         let sc = ex::design_scale(s.width, s.height);
         Self { px, logical: egui::vec2(s.width as f32 / sc, s.height as f32 / sc), time }
@@ -294,6 +299,12 @@ struct Run {
     sent: u64,
     total: u64,
     start_s: f64,
+    /// Sequence mode: which file is loaded, where it starts/ends on the global timeline, and the next one (prefetched).
+    seg_idx: usize,
+    seg_start_s: f64,
+    seg_end_s: f64,
+    total_s: f64,
+    next_prep: Option<Receiver<PrepMsg>>,
     fx: FxState,
     next_step: usize,
     started: Instant,
@@ -305,6 +316,9 @@ pub struct Job {
     pub id: u64,
     pub title: String,
     pub audio: PathBuf,
+    /// Sequence mode: every file with its place on the timeline (empty = single file).
+    pub segments: Vec<ex::AudioSeg>,
+    first_seg: usize,
     pub cfg: Box<AppConfig>,
     pub settings: RenderSettings,
     pub ffmpeg: PathBuf,
@@ -323,8 +337,24 @@ pub struct Job {
     run: Option<Run>,
 }
 
+pub fn log_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("RustVisualizer").join("logs")
+}
+/// Total size of the log files in bytes.
+pub fn log_size() -> u64 {
+    std::fs::read_dir(log_dir()).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()).unwrap_or(0)
+}
+/// Delete every log file; returns how many were removed.
+pub fn clear_logs() -> usize {
+    let mut n = 0;
+    if let Ok(d) = std::fs::read_dir(log_dir()) {
+        for e in d.flatten() { if e.path().is_file() && std::fs::remove_file(e.path()).is_ok() { n += 1; } }
+    }
+    n
+}
+
 pub fn log_file_line(line: &str) {
-    let dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("RustVisualizer").join("logs");
+    let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("render.log")) {
@@ -339,6 +369,31 @@ fn hash_path(p: &std::path::Path) -> u64 {
     h.finish()
 }
 
+/// Decode + analyse one audio file on a worker thread.
+fn spawn_prepare(path: PathBuf, cfg: AudioSettings, rate: f32, cancel: Arc<AtomicBool>, ctx: egui::Context) -> Receiver<PrepMsg> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = (|| -> Result<Prepared, String> {
+            let d = decode::decode_file(&path, &cancel).map_err(|e| e.to_string())?;
+            let txp = tx.clone();
+            let tr = offline::analyze(&d.samples, d.channels, d.sample_rate, &cfg, rate, &cancel, |p| { let _ = txp.send(PrepMsg::Progress(p)); })
+                .ok_or_else(|| "Cancelled".to_string())?;
+            let decoded = d.meta.cover.as_ref().and_then(|b| image::load_from_memory(b).ok());
+            let cover = decoded.as_ref().map(|img| {
+                let t = if img.width().max(img.height()) > 512 { img.thumbnail(512, 512) } else { img.clone() };
+                let rgba = t.to_rgba8();
+                Arc::new(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+            });
+            let cover_small = decoded.as_ref().map(|i| i.thumbnail(128, 128)); // same input the live palette code uses
+            let duration_s = d.duration_s();
+            Ok(Prepared { tr, meta: d.meta, cover, cover_small, cover_key: hash_path(&path), duration_s })
+        })();
+        let _ = tx.send(PrepMsg::Done(res));
+        ctx.request_repaint();
+    });
+    rx
+}
+
 impl Job {
     pub fn is_active(&self) -> bool { matches!(self.state, JobState::Preparing | JobState::Rendering | JobState::Finishing) }
     pub fn is_finished(&self) -> bool { matches!(self.state, JobState::Done | JobState::Failed(_) | JobState::Cancelled) }
@@ -350,44 +405,39 @@ impl Job {
         if self.log.len() > 200 { self.log.remove(0); }
     }
 
+    /// Which file to prepare first (sequence: the one containing the range start).
+    fn first_segment(&self) -> (PathBuf, usize) {
+        if self.segments.is_empty() { return (self.audio.clone(), 0); }
+        let t0 = self.settings.range.map(|r| r.0).unwrap_or(0.0);
+        let i = self.segments.iter().position(|g| t0 < g.start_s + g.dur_s).unwrap_or(0);
+        (self.segments[i].path.clone(), i)
+    }
+    fn total_len_s(&self, prep: &Prepared) -> f64 {
+        self.segments.last().map(|g| g.start_s + g.dur_s).unwrap_or(prep.duration_s as f64)
+    }
+
     fn begin_prepare(&mut self, ctx: &egui::Context) {
         self.state = JobState::Preparing;
         self.progress = 0.0;
         self.cancel = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.prep_rx = Some(rx);
-        let (path, cfg, cancel, rate, ctx2) = (self.audio.clone(), self.cfg.audio.clone(), self.cancel.clone(),
-                                                analysis_rate_for_fps(self.settings.fps), ctx.clone());
+        let (path, first) = self.first_segment();
+        self.first_seg = first;
         self.note("preparing (decode + analysis)");
-        std::thread::spawn(move || {
-            let res = (|| -> Result<Prepared, String> {
-                let d = decode::decode_file(&path, &cancel).map_err(|e| e.to_string())?;
-                let txp = tx.clone();
-                let tr = offline::analyze(&d.samples, d.channels, d.sample_rate, &cfg, rate, &cancel, |p| { let _ = txp.send(PrepMsg::Progress(p)); })
-                    .ok_or_else(|| "Cancelled".to_string())?;
-                let decoded = d.meta.cover.as_ref().and_then(|b| image::load_from_memory(b).ok());
-                let cover = decoded.as_ref().map(|img| {
-                    let t = if img.width().max(img.height()) > 512 { img.thumbnail(512, 512) } else { img.clone() };
-                    let rgba = t.to_rgba8();
-                    Arc::new(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
-                });
-                let cover_small = decoded.as_ref().map(|i| i.thumbnail(128, 128)); // same input the live palette code uses
-                let duration_s = d.duration_s();
-                Ok(Prepared { tr, meta: d.meta, cover, cover_small, cover_key: hash_path(&path), duration_s })
-            })();
-            let _ = tx.send(PrepMsg::Done(res));
-            ctx2.request_repaint();
-        });
+        self.prep_rx = Some(spawn_prepare(path, self.cfg.audio.clone(), analysis_rate_for_fps(self.settings.fps), self.cancel.clone(), ctx.clone()));
     }
 
     fn start_encode(&mut self, prep: Prepared) {
-        let (start, end) = self.settings.range.unwrap_or((0.0, prep.duration_s as f64));
+        let total_len = self.total_len_s(&prep);
+        let (start, end) = self.settings.range.unwrap_or((0.0, total_len));
         let dur = (end - start).max(0.05);
         let total = ((dur * self.settings.fps as f64).round() as u64).max(1);
         let ext = self.out_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
         let part = self.out_path.with_extension(format!("{ext}.part"));
         let extras = compose::extra_audio(&self.layers, &self.project_dir, start, end);
-        let args = ex::build_args(&self.settings, &self.audio, &part, start, dur, &extras);
+        let audio_segs: Vec<ex::AudioSeg> = if self.segments.is_empty() {
+            vec![ex::AudioSeg { path: self.audio.clone(), start_s: 0.0, dur_s: prep.duration_s as f64 }]
+        } else { self.segments.clone() };
+        let args = ex::build_args(&self.settings, &audio_segs, &part, start, dur, &extras);
         self.note(format!("ffmpeg {}", args.join(" ")));
 
         let mut cmd = Command::new(&self.ffmpeg);
@@ -418,13 +468,18 @@ impl Job {
 
         // Deterministic FX: replay from t = 0 up to the range start.
         let rate = prep.tr.rate_hz;
-        let start_step = ((start * rate as f64).round() as usize).min(prep.tr.step_count().saturating_sub(1));
+        let (seg_start, seg_end) = if self.segments.is_empty() { (0.0, total_len) } else {
+            let g = &self.segments[self.first_seg.min(self.segments.len() - 1)];
+            (g.start_s, g.start_s + g.dur_s)
+        };
+        let start_step = (((start - seg_start).max(0.0) * rate as f64).round() as usize).min(prep.tr.step_count().saturating_sub(1));
         let mut fx = FxState::new();
         for i in 0..start_step { fxtrack::step(&mut fx, &prep.tr, &self.cfg, i); }
 
         let palettes = crate::compute_palettes_sync(&self.cfg, prep.cover_small.as_ref());
         self.run = Some(Run { prep, palettes, child: Some(child), tx: Some(tx), writer: Some(writer), stderr: stderr_lines, pending: None,
-            frame: 0, sent: 0, total, start_s: start, fx, next_step: start_step, started: Instant::now(), part, finisher: None });
+            frame: 0, sent: 0, total, start_s: start, seg_idx: self.first_seg, seg_start_s: seg_start, seg_end_s: seg_end,
+            total_s: total_len, next_prep: None, fx, next_step: start_step, started: Instant::now(), part, finisher: None });
         self.state = JobState::Rendering;
         self.progress = 0.0;
     }
@@ -554,13 +609,46 @@ impl Job {
             // 3. render frame k
             let k = run.frame;
             let t = run.start_s + k as f64 / settings.fps as f64;
+            // Sequence: switch to the next track when the timeline passes the end of this one.
+            if !self.segments.is_empty() && run.seg_idx + 1 < self.segments.len() {
+                if t >= run.seg_end_s - 1e-6 {
+                    if run.next_prep.is_none() {
+                        run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
+                            analysis_rate_for_fps(settings.fps), self.cancel.clone(), ctx.clone()));
+                    }
+                    let mut ready: Option<Result<Prepared, String>> = None;
+                    if let Some(rx) = &run.next_prep {
+                        while let Ok(m) = rx.try_recv() { if let PrepMsg::Done(r) = m { ready = Some(r); } }
+                    }
+                    match ready {
+                        Some(Ok(p)) => {
+                            let g = &self.segments[run.seg_idx + 1];
+                            run.palettes = crate::compute_palettes_sync(&self.cfg, p.cover_small.as_ref());
+                            run.seg_idx += 1;
+                            run.seg_start_s = g.start_s;
+                            run.seg_end_s = g.start_s + g.dur_s;
+                            run.prep = p;
+                            run.fx = FxState::new();
+                            run.next_step = 0;
+                            run.next_prep = None;
+                        }
+                        Some(Err(e)) => { self.fail(e); return; }
+                        None => { ctx.request_repaint_after(Duration::from_millis(60)); return; } // next track still loading
+                    }
+                } else if run.next_prep.is_none() && t >= run.seg_end_s - 12.0 {
+                    // prefetch shortly before the switch so the render does not stall
+                    run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
+                        analysis_rate_for_fps(settings.fps), self.cancel.clone(), ctx.clone()));
+                }
+            }
             let rate = run.prep.tr.rate_hz as f64;
-            let target = ((t * rate).round() as usize).min(run.prep.tr.step_count() - 1);
+            let local = (t - run.seg_start_s).max(0.0);
+            let target = ((local * rate).round() as usize).min(run.prep.tr.step_count() - 1);
             while run.next_step <= target {
                 fxtrack::step(&mut run.fx, &run.prep.tr, &self.cfg, run.next_step);
                 run.next_step += 1;
             }
-            let track_len = run.prep.duration_s as f64;
+            let track_len = run.total_s;
             // Background videos must have frame k ready before we draw it (retry next UI frame otherwise).
             if !self.comp.prepare(&self.layers, t, track_len, &self.project_dir) { return; }
             let frame = run.prep.tr.frames[target].clone();
@@ -600,11 +688,11 @@ impl RenderQueue {
     }
 
     pub fn add(&mut self, title: String, audio: PathBuf, cfg: AppConfig, settings: RenderSettings, ffmpeg: PathBuf, out_path: PathBuf,
-               layers: Vec<Layer>, project_dir: PathBuf) -> u64 {
+               layers: Vec<Layer>, project_dir: PathBuf, segments: Vec<ex::AudioSeg>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let comp = Compositor::new(Mode::Export, Some(ffmpeg.clone()), settings.fps, 3840, settings.hw_decode);
-        let mut j = Job { id, title, audio, cfg: Box::new(cfg), settings, ffmpeg, layers, project_dir, comp, out_path, state: JobState::Queued, progress: 0.0,
+        let mut j = Job { id, title, audio, segments, first_seg: 0, cfg: Box::new(cfg), settings, ffmpeg, layers, project_dir, comp, out_path, state: JobState::Queued, progress: 0.0,
             eta_s: None, elapsed_s: 0.0, attempts: 0, log: vec![], cancel: Arc::new(AtomicBool::new(false)), prep_rx: None, run: None };
         j.note("queued");
         self.jobs.push(j);

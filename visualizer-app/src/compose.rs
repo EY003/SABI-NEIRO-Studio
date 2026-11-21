@@ -19,7 +19,7 @@ use crate::video::{self, VideoInfo, VideoStream};
 
 /// Where an image of size `src` lands on `canvas`. `offset` is a fraction of the canvas size.
 /// The caller clips to the canvas, so Cover simply returns a rect larger than the canvas.
-pub fn fit_rect(src: [f32; 2], canvas: egui::Rect, mode: FitMode, offset: [f32; 2]) -> egui::Rect {
+pub fn fit_rect(src: [f32; 2], canvas: egui::Rect, mode: FitMode, offset: [f32; 2], scale: f32) -> egui::Rect {
     let c = canvas.size();
     let (sw, sh) = (src[0].max(1.0), src[1].max(1.0));
     let size = match mode {
@@ -27,7 +27,7 @@ pub fn fit_rect(src: [f32; 2], canvas: egui::Rect, mode: FitMode, offset: [f32; 
         FitMode::Contain => { let s = (c.x / sw).min(c.y / sh); egui::vec2(sw * s, sh * s) }
         FitMode::Cover => { let s = (c.x / sw).max(c.y / sh); egui::vec2(sw * s, sh * s) }
     };
-    egui::Rect::from_center_size(canvas.center() + egui::vec2(offset[0] * c.x, offset[1] * c.y), size)
+    egui::Rect::from_center_size(canvas.center() + egui::vec2(offset[0] * c.x, offset[1] * c.y), size * scale.max(0.01))
 }
 
 pub fn font_family_name(path: &str) -> String {
@@ -215,12 +215,12 @@ impl Compositor {
             let tint = egui::Color32::from_white_alpha(alpha_u8(a));
             match &l.kind {
                 LayerKind::Visualizer => visualizer(painter, a),
-                LayerKind::Image { media, fit, offset } => {
+                LayerKind::Image { media, fit, offset, scale } => {
                     if let Some((id, size)) = self.image_tex(c, media, dir) {
-                        clipped.image(id, fit_rect(size, canvas, *fit, *offset), uv, tint);
+                        clipped.image(id, fit_rect(size, canvas, *fit, *offset, *scale), uv, tint);
                     }
                 }
-                LayerKind::Video { fit, offset, .. } => {
+                LayerKind::Video { fit, offset, scale, .. } => {
                     if let Some(st) = self.videos.get_mut(&l.id) {
                         if let Some(buf) = st.pending.take() {
                             let img = egui::ColorImage::from_rgba_unmultiplied([st.dims.0, st.dims.1], &buf);
@@ -230,7 +230,7 @@ impl Compositor {
                             }
                         }
                         if let Some(tx) = &st.tex {
-                            clipped.image(tx.id(), fit_rect([st.dims.0 as f32, st.dims.1 as f32], canvas, *fit, *offset), uv, tint);
+                            clipped.image(tx.id(), fit_rect([st.dims.0 as f32, st.dims.1 as f32], canvas, *fit, *offset, *scale), uv, tint);
                         }
                     }
                 }
@@ -250,7 +250,7 @@ fn draw_text(p: &egui::Painter, canvas: egui::Rect, tl: &TextLayer, a: f32) {
     let pos = canvas.min + egui::vec2(tl.pos[0] * canvas.width(), tl.pos[1] * canvas.height());
     let align = match tl.align { TextAlign::Left => egui::Align2::LEFT_CENTER, TextAlign::Center => egui::Align2::CENTER_CENTER, TextAlign::Right => egui::Align2::RIGHT_CENTER };
     let col = egui::Color32::from_rgba_unmultiplied(tl.color[0], tl.color[1], tl.color[2], alpha_u8(a));
-    p.text(pos, align, &tl.text, egui::FontId::new(size, family), col);
+    p.text(pos, align, crate::textshape::shape(&tl.text).as_ref(), egui::FontId::new(size, family), col);
 }
 
 // ── export-side helpers ──────────────────────────────────────
@@ -281,7 +281,7 @@ pub fn layer_issues(layers: &[Layer], dir: &Path, ffmpeg_known: bool) -> Vec<Iss
     for l in layers {
         match &l.kind {
             LayerKind::Image { media, .. } | LayerKind::Video { media, .. } => {
-                if media.resolve(dir).is_none() { v.push(err(format!("Layer '{}': file is missing ({}). Relink it in File \u{2192} Missing files.", l.name, media.path.display()))); }
+                if media.resolve(dir).is_none() { v.push(err(format!("Layer '{}': file is missing ({}). Relink it in File > Missing files.", l.name, media.path.display()))); }
             }
             LayerKind::Text(t) => {
                 if let Some(p) = t.font_path.as_ref().filter(|p| !p.is_empty()) {
@@ -306,12 +306,13 @@ mod tests {
     fn canvas() -> egui::Rect { egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0)) }
     #[test]
     fn contain_and_cover() {
-        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Contain, [0.0, 0.0]);
+        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Contain, [0.0, 0.0], 1.0);
         assert_eq!((r.width(), r.height()), (200.0, 100.0));
         assert_eq!(r.center(), egui::pos2(100.0, 100.0));
-        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Cover, [0.0, 0.0]);
+        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Cover, [0.0, 0.0], 1.0);
+        assert_eq!(fit_rect([100.0, 50.0], canvas(), FitMode::Contain, [0.0, 0.0], 0.5).width(), 100.0);
         assert_eq!((r.width(), r.height()), (400.0, 200.0));
-        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Stretch, [0.1, 0.0]);
+        let r = fit_rect([100.0, 50.0], canvas(), FitMode::Stretch, [0.1, 0.0], 1.0);
         assert_eq!(r.center(), egui::pos2(120.0, 100.0));
     }
 }
