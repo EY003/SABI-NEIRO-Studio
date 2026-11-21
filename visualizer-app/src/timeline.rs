@@ -238,12 +238,11 @@ impl Timeline {
                             if let Some(len) = len { l.end_s = Some(ns + len); }
                         }
                     }
-                    Drag::LayerStart(id) => {
+                   Drag::LayerStart(id) => {
                         let snapped_t = snap(t, Some(id), false);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) {
-    }
-}
-                        l.start_s = t.min(l.end_s.unwrap_or(dur as f64) - 0.1).max(0.0);
+                            l.start_s = t.min(l.end_s.unwrap_or(dur as f64) - 0.1).max(0.0);
+                        }
                     },
                     Drag::LayerEnd(id) => {
                         let t = snap(t, Some(id), false);
