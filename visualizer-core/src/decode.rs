@@ -98,11 +98,16 @@ pub fn decode_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, Dec
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| DecodeError::Unsupported("no audio track".into()))?;
     let track_id = track.id;
+    // Reserve exactly what the container announces: growing by doubling can briefly use 2x the memory.
+    let cap_hint = match (track.codec_params.n_frames, track.codec_params.channels) {
+        (Some(n), Some(c)) => (n as usize).saturating_mul(c.count()),
+        _ => 0,
+    };
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| DecodeError::Unsupported(e.to_string()))?;
 
-    let mut samples: Vec<f32> = Vec::new();
+    let mut samples: Vec<f32> = Vec::with_capacity(cap_hint);
     let mut channels = 0usize;
     let mut sample_rate = 0u32;
     let mut sbuf: Option<SampleBuffer<f32>> = None;
@@ -136,6 +141,7 @@ pub fn decode_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, Dec
     }
 
     if samples.is_empty() || channels == 0 { return Err(DecodeError::Empty); }
+    samples.shrink_to_fit();
     Ok(DecodedAudio { samples, channels, sample_rate, meta })
 }
 

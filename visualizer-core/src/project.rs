@@ -68,6 +68,7 @@ pub enum FitMode { #[default] Cover, Contain, Stretch }
 pub enum TextAlign { Left, #[default] Center, Right }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
 pub struct TextLayer {
     pub text: String,
     pub font_path: Option<String>,
@@ -77,10 +78,22 @@ pub struct TextLayer {
     pub align: TextAlign,
     /// Anchor position, 0..1 of the canvas.
     pub pos: [f32; 2],
+    /// Outline thickness in canvas points (the short canvas side is 1080 points); 0 = none.
+    pub outline_width: f32,
+    pub outline_color: [u8; 3],
+    pub shadow: bool,
+    pub shadow_color: [u8; 3],
+    pub shadow_opacity: f32,
+    /// Shadow offset in canvas points (right, down).
+    pub shadow_offset: [f32; 2],
+    /// Shadow softness in canvas points; 0 = hard edge.
+    pub shadow_blur: f32,
 }
 impl Default for TextLayer {
     fn default() -> Self {
-        Self { text: "Text".into(), font_path: None, size: 0.06, color: [255; 3], align: TextAlign::Center, pos: [0.5, 0.1] }
+        Self { text: "Text".into(), font_path: None, size: 0.06, color: [255; 3], align: TextAlign::Center, pos: [0.5, 0.1],
+               outline_width: 0.0, outline_color: [0; 3], shadow: false, shadow_color: [0; 3], shadow_opacity: 0.7,
+               shadow_offset: [4.0, 5.0], shadow_blur: 4.0 }
     }
 }
 
@@ -241,7 +254,7 @@ pub struct UndoStack<T: Clone> {
 }
 
 impl<T: Clone> UndoStack<T> {
-    pub fn new(initial: T) -> Self { Self { baseline: initial, past: vec![], future: vec![], limit: 200 } }
+    pub fn new(initial: T) -> Self { Self { baseline: initial, past: vec![], future: vec![], limit: 60 } }
     /// The last recorded state; compare the live state against it to detect edits.
     pub fn baseline(&self) -> &T { &self.baseline }
 

@@ -156,6 +156,9 @@ pub struct RenderSettings {
     pub background: [u8; 3],
     /// Let ffmpeg use the GPU to DECODE background videos (falls back to the CPU automatically).
     pub hw_decode: bool,
+    /// Keep full colour resolution (H.264 / H.265 / VP9 without alpha). Much crisper thin coloured edges,
+    /// but many phones, TVs and browsers cannot play 4:4:4 video.
+    pub chroma444: bool,
     /// Render only this span (seconds). `None` = whole track.
     pub range: Option<(f64, f64)>,
     pub output_dir: PathBuf,
@@ -172,8 +175,8 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             width: 1920, height: 1080, fps: 60.0, container: Container::Mp4, video_codec: VideoCodec::H264,
-            audio_codec: AudioCodec::Aac, hw: HwAccel::None, rate: RateControl::Quality(75),
-            audio_bitrate_kbps: 192, transparent: false, background: [0, 0, 0], hw_decode: true, range: None,
+            audio_codec: AudioCodec::Aac, hw: HwAccel::None, rate: RateControl::Quality(85),
+            audio_bitrate_kbps: 192, transparent: false, background: [0, 0, 0], hw_decode: true, chroma444: false, range: None,
             output_dir: dirs::video_dir().unwrap_or_else(|| PathBuf::from(".")),
             name_template: "{artist} - {title}".into(), collision: Collision::AutoNumber, ffmpeg_path: None,
             preview: PreviewAspect::MatchExport, sequence: false,
@@ -204,6 +207,7 @@ pub struct ExtraAudio {
 fn pix_fmt(s: &RenderSettings) -> &'static str {
     match s.video_codec {
         VideoCodec::Vp9 if s.transparent => "yuva420p",
+        VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9 if s.chroma444 => "yuv444p",
         VideoCodec::ProRes => if s.transparent { "yuva444p10le" } else { "yuv422p10le" },
         VideoCodec::Animation => if s.transparent { "argb" } else { "rgb24" },
         _ => "yuv420p",
@@ -310,7 +314,7 @@ pub fn build_args(s: &RenderSettings, audio: &[AudioSeg], out: &Path, start: f64
     }
 
     let rgb_out = s.video_codec == VideoCodec::Animation;
-    let vf = if rgb_out { "vflip".to_string() } else { "vflip,scale=out_color_matrix=bt709:out_range=tv".to_string() };
+    let vf = if rgb_out { "vflip".to_string() } else { "vflip,scale=out_color_matrix=bt709:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int".to_string() };
     a.extend(["-vf".into(), vf]);
     a.extend(video_args(s));
     if !rgb_out {
@@ -500,6 +504,14 @@ pub fn preflight(i: &PreflightInput) -> Vec<Issue> {
     }
     if matches!(s.video_codec, VideoCodec::Vp9) && s.hw == HwAccel::Qsv && s.transparent { err(&mut v, "vp9_qsv cannot output alpha. Choose Software.".into()); }
 
+    if s.chroma444 && !s.transparent {
+        if matches!(s.video_codec, VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9) {
+            warn(&mut v, "4:4:4 colour is sharper, but many phones, TVs, browsers and editors cannot play it. Turn it off for maximum compatibility.".into());
+            if s.hw != HwAccel::None { warn(&mut v, "Hardware encoders often cannot encode 4:4:4; if the render fails, switch the encoder to Software.".into()); }
+        } else {
+            warn(&mut v, format!("{} does not support 4:4:4 here; normal 4:2:0 colour will be used.", s.video_codec.label()));
+        }
+    }
     if s.width < 64 || s.height < 64 || s.width > 7680 || s.height > 7680 { err(&mut v, "Resolution must be between 64 and 7680 px per side.".into()); }
     if s.width % 2 != 0 || s.height % 2 != 0 { err(&mut v, "Width and height must be even numbers for this codec.".into()); }
     if !(1.0..=240.0).contains(&s.fps) { err(&mut v, "Frame rate must be between 1 and 240.".into()); }
