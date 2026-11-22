@@ -14,15 +14,18 @@ use crate::textshape;
 
 const RULER_H: f32 = 18.0;
 const RANGE_H: f32 = 14.0;
-const ROW_H: f32 = 20.0;
+const ROW_H: f32 = 20.0;      // minimum height of a layer row
+const MAX_ROW_H: f32 = 64.0;  // rows grow with the panel up to this
 const MIN_WAVE_H: f32 = 36.0;
 const MAX_ROWS: usize = 8;
-const HINT_H: f32 = 16.0;
+const HINT_H: f32 = 22.0;
 const SNAP_PX: f32 = 8.0;
 const GRAB_PX: f32 = 7.0;
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(150, 100, 255);
-const ORANGE: egui::Color32 = egui::Color32::from_rgb(255, 160, 40);
+/// Waveform colour: a lighter tint of the app accent (#B7410E) so it reads on black.
+const WAVE: egui::Color32 = egui::Color32::from_rgb(222, 104, 48);
+const ORANGE: egui::Color32 = egui::Color32::from_rgb(255, 176, 64);
+const SNAP: egui::Color32 = egui::Color32::from_rgb(255, 225, 0);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
@@ -48,9 +51,10 @@ pub struct In<'a> {
 }
 pub struct Out { pub seek: Option<f32> }
 
-pub struct Timeline { t0: f32, len: f32, drag: Drag }
+pub struct Timeline { t0: f32, len: f32, drag: Drag, /// show the whole timeline and keep showing it as the length changes
+    fit: bool, snap_line: Option<f64> }
 
-struct Geo { rect: egui::Rect, ruler: egui::Rect, rng: egui::Rect, wave: egui::Rect, rows_y: f32, t0: f32, len: f32 }
+struct Geo { rect: egui::Rect, ruler: egui::Rect, rng: egui::Rect, wave: egui::Rect, rows_y: f32, row_h: f32, t0: f32, len: f32 }
 impl Geo {
     fn x(&self, t: f32) -> f32 { self.rect.left() + (t - self.t0) / self.len * self.rect.width() }
     fn t(&self, x: f32) -> f32 { self.t0 + (x - self.rect.left()) / self.rect.width() * self.len }
@@ -91,30 +95,35 @@ fn hit_test(g: &Geo, p: egui::Pos2, range: Option<(f64, f64)>, layers: &[Layer],
         return Drag::Seek;
     }
     for (ri, &li) in rows.iter().enumerate() {
-        let y = g.rows_y + ri as f32 * ROW_H;
-        if p.y < y || p.y > y + ROW_H { continue; }
+        let y = g.rows_y + ri as f32 * g.row_h;
+        if p.y < y || p.y > y + g.row_h { continue; }
         let l = &layers[li];
         let (xs, xe) = (g.x(l.start_s as f32), g.x(l.end_s.unwrap_or(dur as f64) as f32));
-        if p.x >= xs - 4.0 && p.x <= xe + 4.0 {
+        if p.x >= xs - GRAB_PX && p.x <= xe + GRAB_PX {
             if l.locked { return Drag::None; }
-            return if near(xs) { Drag::LayerStart(l.id) } else if near(xe) { Drag::LayerEnd(l.id) }
-                   else { Drag::LayerMove { id: l.id, grab: t - l.start_s } };
+            let (ds, de) = ((p.x - xs).abs(), (p.x - xe).abs());
+            if ds <= GRAB_PX || de <= GRAB_PX {
+                return if ds <= de { Drag::LayerStart(l.id) } else { Drag::LayerEnd(l.id) }; // the nearer edge wins
+            }
+            return Drag::LayerMove { id: l.id, grab: t - l.start_s };
         }
     }
     Drag::None
 }
 
 impl Timeline {
-    pub fn new() -> Self { Self { t0: 0.0, len: 0.0, drag: Drag::None } }
-    pub fn fit(&mut self) { self.len = 0.0; self.t0 = 0.0; }
+    pub fn new() -> Self { Self { t0: 0.0, len: 0.0, drag: Drag::None, fit: true, snap_line: None } }
+    pub fn fit(&mut self) { self.fit = true; self.len = 0.0; self.t0 = 0.0; }
     /// Zoom around `center` (seconds); factor > 1 zooms in.
     pub fn zoom_step(&mut self, factor: f32, center: f32, dur: f32) {
+        self.fit = false;
         if self.len <= 0.0 { self.len = dur; }
         let new_len = (self.len / factor).clamp(dur.min(0.25), dur.max(0.25));
         self.t0 = center - (center - self.t0) * (new_len / self.len);
         self.len = new_len;
     }
     pub fn zoom_range(&mut self, a: f32, b: f32, dur: f32) {
+        self.fit = false;
         let pad = (b - a) * 0.08;
         self.t0 = (a - pad).max(0.0);
         self.len = ((b - a) + 2.0 * pad).clamp(dur.min(0.25), dur.max(0.25));
@@ -123,13 +132,18 @@ impl Timeline {
     pub fn ui(&mut self, ui: &mut egui::Ui, inp: In) -> Out {
         let In { dur, pos, playing, wave, segs, range, layers, selected, analysing } = inp;
         let dur = dur.max(0.001);
-        if self.len <= 0.0 || self.len > dur { self.len = dur; }
+        if self.fit || self.len <= 0.0 || self.len > dur { self.len = dur; if self.fit { self.t0 = 0.0; } }
         self.len = self.len.max(dur.min(0.25));
         self.t0 = self.t0.clamp(0.0, (dur - self.len).max(0.0));
 
         let rows: Vec<usize> = layers.iter().enumerate().filter(|(_, l)| !matches!(l.kind, LayerKind::Visualizer)).map(|(i, _)| i).take(MAX_ROWS).collect();
-        let rows_h = rows.len() as f32 * ROW_H;
-        let wave_h = (ui.available_height() - HINT_H - RULER_H - RANGE_H - rows_h - 6.0).max(MIN_WAVE_H);
+        // Everything scales with the panel height: the waveform takes ~45% of the body and the layer rows
+        // share the rest (each between ROW_H and MAX_ROW_H); any surplus goes back to the waveform.
+        let body = (ui.available_height() - HINT_H - RULER_H - RANGE_H - 6.0).max(MIN_WAVE_H);
+        let n_rows = rows.len();
+        let row_h = if n_rows == 0 { ROW_H } else { ((body - (body * 0.45).max(MIN_WAVE_H)) / n_rows as f32).clamp(ROW_H, MAX_ROW_H) };
+        let rows_h = n_rows as f32 * row_h;
+        let wave_h = (body - rows_h).max(MIN_WAVE_H);
         let total_h = RULER_H + RANGE_H + wave_h + 4.0 + rows_h;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), total_h), egui::Sense::click_and_drag());
         let w = rect.width().max(1.0);
@@ -158,6 +172,7 @@ impl Timeline {
             rng: egui::Rect::from_min_size(rect.min + egui::vec2(0.0, RULER_H), egui::vec2(w, RANGE_H)),
             wave: egui::Rect::from_min_size(rect.min + egui::vec2(0.0, RULER_H + RANGE_H), egui::vec2(w, wave_h)),
             rows_y: rect.top() + RULER_H + RANGE_H + wave_h + 4.0,
+            row_h,
             t0: self.t0, len: self.len,
         };
         let px_per_s = w / g.len;
@@ -178,25 +193,37 @@ impl Timeline {
         if let Some(i) = icon { ui.ctx().set_cursor_icon(i); }
 
         // ── snapping targets ──
-        let snap = |t: f64, skip_layer: Option<u64>, skip_range: bool| -> f64 {
-            if shift { return t; }
+        // `snap_to` returns the target a time is close enough to (within SNAP_PX), if any.
+        let snap_to = |t: f64, skip_layer: Option<u64>, skip_range: bool| -> Option<f64> {
+            if shift { return None; }
             let mut c: Vec<f64> = vec![0.0, dur as f64, pos as f64];
             if !skip_range { if let Some((a, b)) = *range { c.push(a); c.push(b); } }
             for l in layers.iter().filter(|l| Some(l.id) != skip_layer && !matches!(l.kind, LayerKind::Visualizer)) {
                 c.push(l.start_s); c.push(l.end_s.unwrap_or(dur as f64));
             }
             for s in segs { c.push(s.start as f64); c.push((s.start + s.len) as f64); }
-            let mut best = t;
+            let mut best: Option<f64> = None;
             let mut best_d = SNAP_PX;
-            for x in c { let d = ((x - t).abs() as f32) * px_per_s; if d <= best_d { best_d = d; best = x; } }
+            for x in c { let d = ((x - t).abs() as f32) * px_per_s; if d <= best_d { best_d = d; best = Some(x); } }
             best
         };
+        // For a movable block [start, start+len]: snap whichever edge is closer to a target.
+        let snap_block = |start: f64, len: f64, skip_layer: Option<u64>, skip_range: bool| -> (f64, Option<f64>) {
+            let (c1, c2) = (snap_to(start, skip_layer, skip_range), snap_to(start + len, skip_layer, skip_range));
+            match (c1, c2) {
+                (Some(a), Some(b)) => if (a - start).abs() <= (b - (start + len)).abs() { (a, Some(a)) } else { (b - len, Some(b)) },
+                (Some(a), None) => (a, Some(a)),
+                (None, Some(b)) => (b - len, Some(b)),
+                (None, None) => (start, None),
+            }
+        };
 
-        // ── drag start ──
+        // ── drag start (hit-test where the button went DOWN: by the time egui reports a drag the pointer has already moved) ──
         let mut out = Out { seek: None };
         if resp.drag_started() {
             self.drag = Drag::None;
-            if let Some(p) = resp.interact_pointer_pos() {
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            if let Some(p) = origin {
                 if ui.input(|i| i.pointer.middle_down()) { self.drag = Drag::Pan; }
                 else {
                     self.drag = hit_test(&g, p, *range, layers, &rows, dur);
@@ -205,6 +232,7 @@ impl Timeline {
             }
         }
         // ── dragging ──
+        let mut snapped: Option<f64> = None;
         if resp.dragged() {
             if let Some(p) = resp.interact_pointer_pos() {
                 let t = g.t(p.x).clamp(0.0, dur) as f64;
@@ -212,32 +240,35 @@ impl Timeline {
                     Drag::Seek => out.seek = Some(t as f32),
                     Drag::Pan => self.t0 = (self.t0 - resp.drag_delta().x / w * self.len).clamp(0.0, (dur - self.len).max(0.0)),
                     Drag::RangeIn => if let Some((_, b)) = *range {
-                        let a = snap(t, None, true).min(b - 0.05).max(0.0);
+                        snapped = snap_to(t, None, true);
+                        let a = snapped.unwrap_or(t).min(b - 0.05).max(0.0);
                         *range = Some((a, b));
                     },
                     Drag::RangeOut => if let Some((a, _)) = *range {
-                        let b = snap(t, None, true).max(a + 0.05).min(dur as f64);
+                        snapped = snap_to(t, None, true);
+                        let b = snapped.unwrap_or(t).max(a + 0.05).min(dur as f64);
                         *range = Some((a, b));
                     },
                     Drag::RangeNew { anchor } => {
-                        let (a, b) = (anchor.min(snap(t, None, true)), anchor.max(snap(t, None, true)));
+                        snapped = snap_to(t, None, true);
+                        let tt = snapped.unwrap_or(t);
+                        let (a, b) = (anchor.min(tt), anchor.max(tt));
                         if b - a > 0.05 { *range = Some((a, b)); }
                     }
                     Drag::RangeMove { grab } => if let Some((a, b)) = *range {
                         let len = b - a;
-                        let mut ns = (t - grab).clamp(0.0, (dur as f64 - len).max(0.0));
-                        let (s1, s2) = (snap(ns, None, true), snap(ns + len, None, true) - len);
-                        ns = if (s1 - ns).abs() <= (s2 - ns).abs() { s1 } else { s2 };
+                        let ns = (t - grab).clamp(0.0, (dur as f64 - len).max(0.0));
+                        let (ns, line) = snap_block(ns, len, None, true);
+                        snapped = line;
                         let ns = ns.clamp(0.0, (dur as f64 - len).max(0.0));
                         *range = Some((ns, ns + len));
                     },
                     Drag::LayerMove { id, grab } => {
                         let (s0, e0) = layers.iter().find(|l| l.id == id).map(|l| (l.start_s, l.end_s)).unwrap_or((0.0, None));
                         let len = e0.map(|e| e - s0);
-                        let mut ns = (t - grab).max(0.0);
-                        let s1 = snap(ns, Some(id), false);
-                        let s2 = len.map(|l| snap(ns + l, Some(id), false) - l).unwrap_or(s1);
-                        ns = if (s1 - ns).abs() <= (s2 - ns).abs() { s1 } else { s2 };
+                        let ns = (t - grab).max(0.0);
+                        let (ns, line) = match len { Some(l) => snap_block(ns, l, Some(id), false), None => { let c = snap_to(ns, Some(id), false); (c.unwrap_or(ns), c) } };
+                        snapped = line;
                         let ns = ns.max(0.0);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) {
                             l.start_s = ns;
@@ -245,13 +276,15 @@ impl Timeline {
                         }
                     }
                     Drag::LayerStart(id) => {
-                        let t = snap(t, Some(id), false); // snap BEFORE borrowing the layers mutably
+                        snapped = snap_to(t, Some(id), false); // compute BEFORE borrowing the layers mutably
+                        let t = snapped.unwrap_or(t);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) {
                             l.start_s = t.min(l.end_s.unwrap_or(dur as f64) - 0.1).max(0.0);
                         }
                     }
                     Drag::LayerEnd(id) => {
-                        let t = snap(t, Some(id), false);
+                        snapped = snap_to(t, Some(id), false);
+                        let t = snapped.unwrap_or(t);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) { l.end_s = Some(t.max(l.start_s + 0.1).min(dur as f64)); }
                     }
                     Drag::None => {}
@@ -266,6 +299,7 @@ impl Timeline {
                 }
             }
         }
+        self.snap_line = snapped;
         if resp.double_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
                 match hit_test(&g, p, *range, layers, &rows, dur) {
@@ -323,7 +357,7 @@ impl Timeline {
                     let (mid, h) = (g.wave.center().y, g.wave.height() * 0.46);
                     for (i, (mn, mx)) in wf.peaks(a - off, b - off, n).iter().enumerate() {
                         let x = xa + i as f32 + 0.5;
-                        painter.line_segment([egui::pos2(x, mid - mx * h), egui::pos2(x, mid - mn * h)], egui::Stroke::new(1.0_f32, ACCENT));
+                        painter.line_segment([egui::pos2(x, mid - mx * h), egui::pos2(x, mid - mn * h)], egui::Stroke::new(1.0_f32, WAVE));
                     }
                 }
             }
@@ -355,20 +389,29 @@ impl Timeline {
         // layer bars
         for (ri, &li) in rows.iter().enumerate() {
             let l = &layers[li];
-            let y = g.rows_y + ri as f32 * ROW_H;
+            let y = g.rows_y + ri as f32 * row_h;
             let (s, e) = (l.start_s as f32, l.end_s.unwrap_or(dur as f64) as f32);
             let (xs, xe) = (g.x(s).max(rect.left()), g.x(e).min(rect.right()));
             if xe <= xs { continue; }
             let base = match &l.kind { LayerKind::Image { .. } => (80, 140, 220), LayerKind::Video { .. } => (160, 100, 220), LayerKind::Text(_) => (90, 190, 120), LayerKind::Visualizer => (200, 200, 200) };
             let alpha = if l.visible { 215 } else { 70 };
-            let bar = egui::Rect::from_min_max(egui::pos2(xs, y + 2.0), egui::pos2(xe, y + ROW_H - 2.0));
+            let bar = egui::Rect::from_min_max(egui::pos2(xs, y + 2.0), egui::pos2(xe, y + row_h - 2.0));
             painter.rect_filled(bar, 3.0, egui::Color32::from_rgba_unmultiplied(base.0, base.1, base.2, alpha));
             if !l.locked {
                 for x in [bar.left(), bar.right() - 3.0] { painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(3.0, bar.height())), 1.0, egui::Color32::from_black_alpha(110)); }
             }
             if *selected == Some(l.id) { painter.rect_stroke(bar, 3.0, egui::Stroke::new(1.5_f32, egui::Color32::WHITE)); }
             let label = format!("{}  {}", l.name, fmt_t(e - s));
-            painter.with_clip_rect(bar).text(bar.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, textshape::shape(&label).as_ref(), egui::FontId::proportional(11.0), egui::Color32::BLACK);
+            painter.with_clip_rect(bar).text(bar.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, textshape::shape(&label).as_ref(), egui::FontId::proportional((row_h * 0.55).clamp(11.0, 17.0)), egui::Color32::BLACK);
+        }
+
+        // yellow line where a drag has snapped
+        if let (Some(t), true) = (self.snap_line, self.drag != Drag::None) {
+            let x = g.x(t as f32);
+            if x >= rect.left() && x <= rect.right() {
+                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0_f32, SNAP));
+                painter.text(egui::pos2(x + 5.0, g.rng.top() + 1.0), egui::Align2::LEFT_TOP, "snap", egui::FontId::monospace(10.0), SNAP);
+            }
         }
 
         // while dragging: show what is being set

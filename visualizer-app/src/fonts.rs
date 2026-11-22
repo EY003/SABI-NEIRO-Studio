@@ -12,35 +12,55 @@ fn fonts_dir() -> PathBuf {
     PathBuf::from(root).join("Fonts")
 }
 
-static FALLBACKS: OnceLock<Vec<(String, &'static [u8])>> = OnceLock::new();
+/// Scripts that need a big system font (loaded only while some visible text uses them).
+pub const NEED_CJK: u8 = 1;
+pub const NEED_HANGUL: u8 = 2;
 
-/// Read once; the bytes are leaked on purpose so egui can borrow them without copies.
-fn fallbacks() -> &'static [(String, &'static [u8])] {
-    FALLBACKS.get_or_init(|| {
-        let dir = fonts_dir();
-        let mut v = Vec::new();
-        // Order = priority for a glyph that earlier fonts lack:
-        // Segoe UI (Latin ext, Greek, Cyrillic, Arabic, Hebrew) -> YaHei (Chinese + kana) -> Malgun (Korean)
-        // -> Nirmala (Indic) -> Leelawadee (Thai) -> Segoe UI Symbol.
-        for f in ["segoeui.ttf", "msyh.ttc", "malgun.ttf", "nirmala.ttf", "LeelawUI.ttf", "seguisym.ttf"] {
-            if let Ok(bytes) = std::fs::read(dir.join(f)) {
-                let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-                v.push((format!("sys_{f}"), leaked));
-            }
+/// Which big fonts does this text need?
+pub fn needs_of(s: &str) -> u8 {
+    let mut n = 0;
+    for c in s.chars() {
+        let u = c as u32;
+        if u < 0x1100 { continue; } // Latin, Greek, Cyrillic, Hebrew, Arabic ... (small fonts cover these)
+        match u {
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF => n |= NEED_HANGUL,
+            0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FFFF => n |= NEED_CJK,
+            _ => {}
         }
-        v
+    }
+    n
+}
+
+/// Small fonts (about 4 MB together) are cached; the big CJK / Hangul fonts are read on demand and
+/// dropped with the font definitions when no text needs them any more (nothing is leaked).
+fn small_fallbacks() -> &'static [(String, Vec<u8>)] {
+    static SMALL: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
+    SMALL.get_or_init(|| {
+        let dir = fonts_dir();
+        // Segoe UI (Arabic, Hebrew, Latin extended) -> Nirmala UI (Indic) -> Leelawadee UI (Thai) -> Segoe UI Symbol
+        ["segoeui.ttf", "nirmala.ttf", "LeelawUI.ttf", "seguisym.ttf"].iter()
+            .filter_map(|f| std::fs::read(dir.join(f)).ok().map(|b| (format!("sys_{f}"), b)))
+            .collect()
     })
 }
 
 /// Append the system fallbacks to egui's Proportional and Monospace families.
-pub fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
-    for (name, bytes) in fallbacks() {
-        fonts.font_data.insert(name.clone(), egui::FontData::from_static(*bytes));
+pub fn install_fallbacks(fonts: &mut egui::FontDefinitions, needs: u8) {
+    let mut add = |name: String, bytes: Vec<u8>| {
+        fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes));
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(list) = fonts.families.get_mut(&fam) {
-                if !list.contains(name) { list.push(name.clone()); }
+                if !list.contains(&name) { list.push(name.clone()); }
             }
         }
+    };
+    for (name, bytes) in small_fallbacks() { add(name.clone(), bytes.clone()); }
+    let dir = fonts_dir();
+    if needs & NEED_CJK != 0 {
+        if let Ok(b) = std::fs::read(dir.join("msyh.ttc")) { add("sys_msyh.ttc".into(), b); }     // Chinese + kana
+    }
+    if needs & NEED_HANGUL != 0 {
+        if let Ok(b) = std::fs::read(dir.join("malgun.ttf")) { add("sys_malgun.ttf".into(), b); } // Korean
     }
 }
 

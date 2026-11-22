@@ -250,7 +250,47 @@ fn draw_text(p: &egui::Painter, canvas: egui::Rect, tl: &TextLayer, a: f32) {
     let pos = canvas.min + egui::vec2(tl.pos[0] * canvas.width(), tl.pos[1] * canvas.height());
     let align = match tl.align { TextAlign::Left => egui::Align2::LEFT_CENTER, TextAlign::Center => egui::Align2::CENTER_CENTER, TextAlign::Right => egui::Align2::RIGHT_CENTER };
     let col = egui::Color32::from_rgba_unmultiplied(tl.color[0], tl.color[1], tl.color[2], alpha_u8(a));
-    p.text(pos, align, crate::textshape::shape(&tl.text).as_ref(), egui::FontId::new(size, family), col);
+    let shaped = crate::textshape::shape(&tl.text);
+    let text: &str = shaped.as_ref();
+    let font = egui::FontId::new(size, family);
+    let draw = |offset: egui::Vec2, color: egui::Color32| { p.text(pos + offset, align, text, font.clone(), color); };
+    // egui has no outline/shadow for text, so both are built from offset copies of the same text.
+    // Offsets are in canvas points (short side = 1080), identical in preview and export.
+
+    if tl.shadow && tl.shadow_opacity > 0.0 {
+        let base = (tl.shadow_opacity.clamp(0.0, 1.0) * a).clamp(0.0, 1.0);
+        let off = egui::vec2(tl.shadow_offset[0], tl.shadow_offset[1]);
+        let rgb = tl.shadow_color;
+        if tl.shadow_blur > 0.5 {
+            // soft shadow: faint copies spread over two rings; together they add up to `base` at the centre
+            let mut spots = vec![egui::Vec2::ZERO];
+            for (ring, r) in [(8usize, tl.shadow_blur * 0.5), (12usize, tl.shadow_blur)] {
+                for i in 0..ring {
+                    let ang = i as f32 / ring as f32 * std::f32::consts::TAU;
+                    spots.push(egui::vec2(ang.cos() * r, ang.sin() * r));
+                }
+            }
+            let per = 1.0 - (1.0 - base).powf(1.0 / spots.len() as f32);
+            let col = egui::Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], alpha_u8(per));
+            for s in spots { draw(off + s, col); }
+        } else {
+            draw(off, egui::Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], alpha_u8(base)));
+        }
+    }
+    if tl.outline_width > 0.1 {
+        let w = tl.outline_width;
+        let oc = tl.outline_color;
+        let col = egui::Color32::from_rgba_unmultiplied(oc[0], oc[1], oc[2], alpha_u8(a));
+        let steps = ((8.0 + 4.0 * w).round() as usize).clamp(12, 40);
+        let rings: &[f32] = if w > 3.0 { &[1.0, 0.5] } else { &[1.0] }; // thick outlines get an inner ring so there are no gaps
+        for k in rings {
+            for i in 0..steps {
+                let ang = i as f32 / steps as f32 * std::f32::consts::TAU;
+                draw(egui::vec2(ang.cos(), ang.sin()) * (w * k), col);
+            }
+        }
+    }
+    draw(egui::Vec2::ZERO, col);
 }
 
 // ── export-side helpers ──────────────────────────────────────

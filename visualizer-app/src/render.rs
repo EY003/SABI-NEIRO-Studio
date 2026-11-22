@@ -234,6 +234,19 @@ impl Offscreen {
     }
 }
 
+impl Drop for Offscreen {
+    /// Called when the app returns to the overlay: give the GPU objects back.
+    fn drop(&mut self) {
+        unsafe {
+            let gl = &self.gl;
+            if let Some(f) = self.fbo.take() { gl.delete_framebuffer(f); }
+            if let Some(t) = self.tex.take() { gl.delete_texture(t); }
+            for b in self.pbos.iter_mut() { if let Some(x) = b.take() { gl.delete_buffer(x); } }
+        }
+        self.painter.destroy();
+    }
+}
+
 /// egui's output is premultiplied; ffmpeg's rgba input expects straight alpha.
 pub fn unpremultiply(buf: &mut [u8]) {
     for px in buf.chunks_exact_mut(4) {
@@ -370,13 +383,13 @@ fn hash_path(p: &std::path::Path) -> u64 {
 }
 
 /// Decode + analyse one audio file on a worker thread.
-fn spawn_prepare(path: PathBuf, cfg: AudioSettings, rate: f32, cancel: Arc<AtomicBool>, ctx: egui::Context) -> Receiver<PrepMsg> {
+fn spawn_prepare(path: PathBuf, cfg: AudioSettings, rate: f32, keep: offline::Keep, cancel: Arc<AtomicBool>, ctx: egui::Context) -> Receiver<PrepMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let res = (|| -> Result<Prepared, String> {
             let d = decode::decode_file(&path, &cancel).map_err(|e| e.to_string())?;
             let txp = tx.clone();
-            let tr = offline::analyze(&d.samples, d.channels, d.sample_rate, &cfg, rate, &cancel, |p| { let _ = txp.send(PrepMsg::Progress(p)); })
+            let tr = offline::analyze(&d.samples, d.channels, d.sample_rate, &cfg, rate, keep, &cancel, |p| { let _ = txp.send(PrepMsg::Progress(p)); })
                 .ok_or_else(|| "Cancelled".to_string())?;
             let decoded = d.meta.cover.as_ref().and_then(|b| image::load_from_memory(b).ok());
             let cover = decoded.as_ref().map(|img| {
@@ -423,7 +436,7 @@ impl Job {
         let (path, first) = self.first_segment();
         self.first_seg = first;
         self.note("preparing (decode + analysis)");
-        self.prep_rx = Some(spawn_prepare(path, self.cfg.audio.clone(), analysis_rate_for_fps(self.settings.fps), self.cancel.clone(), ctx.clone()));
+        self.prep_rx = Some(spawn_prepare(path, self.cfg.audio.clone(), analysis_rate_for_fps(self.settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
     }
 
     fn start_encode(&mut self, prep: Prepared) {
@@ -614,7 +627,7 @@ impl Job {
                 if t >= run.seg_end_s - 1e-6 {
                     if run.next_prep.is_none() {
                         run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
-                            analysis_rate_for_fps(settings.fps), self.cancel.clone(), ctx.clone()));
+                            analysis_rate_for_fps(settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
                     }
                     let mut ready: Option<Result<Prepared, String>> = None;
                     if let Some(rx) = &run.next_prep {
@@ -638,7 +651,7 @@ impl Job {
                 } else if run.next_prep.is_none() && t >= run.seg_end_s - 12.0 {
                     // prefetch shortly before the switch so the render does not stall
                     run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
-                        analysis_rate_for_fps(settings.fps), self.cancel.clone(), ctx.clone()));
+                        analysis_rate_for_fps(settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
                 }
             }
             let rate = run.prep.tr.rate_hz as f64;

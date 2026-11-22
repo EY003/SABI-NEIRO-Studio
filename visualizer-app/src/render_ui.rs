@@ -9,6 +9,8 @@ use visualizer_core::config::AppConfig;
 use visualizer_core::export::*;
 use visualizer_core::project::Layer;
 
+use crate::ui_util::{drag_reset, slider_reset};
+
 use crate::render::{JobState, RenderQueue};
 use crate::studio::Studio;
 
@@ -136,9 +138,9 @@ impl RenderUi {
                 egui::ComboBox::from_id_source("res").selected_text(cur).show_ui(ui, |ui| {
                     for r in RESOLUTIONS { if ui.selectable_label(cur == r.0, r.0).clicked() { s.width = r.1; s.height = r.2; } }
                 });
-                ui.add(egui::DragValue::new(&mut s.width).clamp_range(64..=7680).speed(2));
+                drag_reset(ui, &mut s.width, 64..=7680, 2.0, "", "", 1920);
                 ui.label("\u{00D7}");
-                ui.add(egui::DragValue::new(&mut s.height).clamp_range(64..=7680).speed(2));
+                drag_reset(ui, &mut s.height, 64..=7680, 2.0, "", "", 1080);
             });
             ui.end_row();
 
@@ -174,16 +176,21 @@ impl RenderUi {
             ui.checkbox(&mut s.hw_decode, "GPU-decode background videos");
             ui.end_row();
 
+            ui.label("Colour detail");
+            ui.checkbox(&mut s.chroma444, "Sharper edges (4:4:4)")
+                .on_hover_text("Normal video stores colour at half resolution, which softens thin coloured lines such as the bars.\n4:4:4 keeps full colour detail (H.264 / H.265 / VP9 without transparency).\nMany phones, TVs, browsers and editors cannot play it. Quality 85+ also helps.");
+            ui.end_row();
+
             ui.label("Quality");
             let fixed = matches!(s.video_codec, VideoCodec::ProRes | VideoCodec::Animation);
             ui.add_enabled_ui(!fixed, |ui| {
                 ui.horizontal(|ui| {
                     let mut by_q = matches!(s.rate, RateControl::Quality(_));
-                    if ui.radio_value(&mut by_q, true, "Quality").clicked() { s.rate = RateControl::Quality(75); }
+                    if ui.radio_value(&mut by_q, true, "Quality").clicked() { s.rate = RateControl::Quality(85); }
                     if ui.radio_value(&mut by_q, false, "Bitrate").clicked() { s.rate = RateControl::Bitrate(12_000); }
                     match &mut s.rate {
-                        RateControl::Quality(q) => { ui.add(egui::Slider::new(q, 1..=100)); }
-                        RateControl::Bitrate(k) => { ui.add(egui::DragValue::new(k).clamp_range(300..=400_000).suffix(" kbps").speed(50)); }
+                        RateControl::Quality(q) => { slider_reset(ui, q, 1..=100, "", 85); }
+                        RateControl::Bitrate(k) => { drag_reset(ui, k, 300..=400_000, 50.0, "", " kbps", 12_000); }
                     }
                 });
             });

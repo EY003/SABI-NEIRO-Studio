@@ -227,7 +227,8 @@ impl Studio {
         std::thread::spawn(move || {
             let txp = tx.clone();
             let ctxp = ctx2.clone();
-            let tr = offline::analyze(&track.samples, track.channels, track.sample_rate, &cfg.audio, rate, &cancel, |p| {
+            let keep = crate::fxtrack::keep_for(&cfg);
+            let tr = offline::analyze(&track.samples, track.channels, track.sample_rate, &cfg.audio, rate, keep, &cancel, |p| {
                 let _ = txp.send(Msg::Progress { gen, p: p * 0.7 });
                 ctxp.request_repaint();
             });
@@ -310,7 +311,7 @@ impl Studio {
             self.stale_since = Some(Instant::now());
         }
         if let (Some(b), true) = (&self.built, !self.analyzing) {
-            let stale = b.tr.settings != cfg.audio || !b.fx.is_valid_for(cfg)
+            let stale = b.tr.settings != cfg.audio || b.tr.keep != crate::fxtrack::keep_for(cfg) || !b.fx.is_valid_for(cfg)
                 || (b.tr.rate_hz - analysis_rate_for_fps(self.fps)).abs() > 0.01;
             if stale {
                 let since = *self.stale_since.get_or_insert_with(Instant::now);
@@ -485,7 +486,7 @@ impl Studio {
 
         let mut jump: Option<i32> = None;
         let mut seek: Option<f32> = None;
-        egui::TopBottomPanel::bottom("studio_transport").resizable(true).default_height(200.0).height_range(130.0..=720.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("studio_transport").resizable(true).default_height(270.0).height_range(150.0..=900.0).show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Prev").on_hover_text("Previous track").clicked() { jump = Some(-1); }
@@ -495,7 +496,8 @@ impl Studio {
                 ui.monospace(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
                 let mut v = self.player.volume();
                 ui.label("Vol");
-                if ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false)).changed() { self.player.set_volume(v); }
+                let vr = ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false)).on_hover_text("Right-click to reset to 100%");
+                if vr.secondary_clicked() { self.player.set_volume(1.0); } else if vr.changed() { self.player.set_volume(v); }
                 ui.separator();
                 match *range {
                     Some((a, b)) => {
@@ -517,6 +519,10 @@ impl Studio {
                 analysing: if self.analyzing { Some(self.progress) } else { None },
             });
             seek = out.seek;
+            // Fill the panel exactly. If the content were even a pixel shorter, egui would shrink the
+            // panel to the content every frame (the "slowly falls back" effect).
+            let rest = ui.available_height();
+            if rest > 0.0 { ui.allocate_space(egui::vec2(1.0, rest)); }
         });
         if let Some(t) = seek { self.seek_global(ctx, t); }
 
@@ -562,6 +568,31 @@ impl Studio {
     }
 
     pub fn is_playing(&self) -> bool { self.player.is_playing() }
+
+    /// Free everything heavy (decoded audio, analysis frames, waveform, FX checkpoints). The track list
+    /// and the metadata stay, so `reactivate` can bring the selected track back.
+    pub fn release(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.gen += 1;
+        self.loaded = None;
+        self.built = None;
+        self.analyzing = false;
+        self.progress = 0.0;
+        self.cursor = FxCursor::new();
+        self.pending_seek = None;
+        self.want_play = false;
+        self.player.set_track(None);
+        for e in self.entries.iter_mut() {
+            if matches!(e.status, Status::Loading | Status::Analyzing | Status::Ready) { e.status = Status::Pending; }
+        }
+        self.timeline.fit();
+    }
+
+    /// Reload the selected track after `release` (decodes and analyses it again).
+    pub fn reactivate(&mut self, ctx: &egui::Context) {
+        if self.loaded.is_none() { if let Some(id) = self.selected { self.select(ctx, id, false); } }
+    }
 
     /// True while a file owns the title/cover (the app should ignore system media-session updates).
     pub fn owns_track_info(&self) -> bool { self.selected.is_some() }

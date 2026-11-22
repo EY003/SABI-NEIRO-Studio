@@ -9,7 +9,7 @@ use eframe::egui;
 use visualizer_core::project::*;
 
 use crate::fonts::{self, SysFont};
-use crate::ui_util;
+use crate::ui_util::{self, checkbox_reset, color_reset, drag_reset, log_slider_reset, slider_reset};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pick { Image, Video, Font(u64), Replace(u64) }
@@ -157,27 +157,27 @@ impl LayersUi {
         ui.add_enabled_ui(!locked, |ui| {
             let l = &mut doc.layers[idx];
             ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut l.name); });
-            ui.horizontal(|ui| { ui.label("Opacity"); ui.add(egui::Slider::new(&mut l.opacity, 0.0..=1.0)); });
+            slider_reset(ui, &mut l.opacity, 0.0..=1.0, "Opacity", 1.0);
 
             egui::CollapsingHeader::new("Timing and fades").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Start");
-                    ui.add(egui::DragValue::new(&mut l.start_s).clamp_range(0.0..=36_000.0).speed(0.1).suffix(" s"));
+                    drag_reset(ui, &mut l.start_s, 0.0..=36_000.0, 0.1, "", " s", 0.0);
                     if ui.small_button("playhead").clicked() { l.start_s = playhead; }
                 });
                 ui.horizontal(|ui| {
                     let mut has_end = l.end_s.is_some();
                     if ui.checkbox(&mut has_end, "End").changed() { l.end_s = if has_end { Some(playhead.max(l.start_s + 1.0)) } else { None }; }
                     if let Some(e) = &mut l.end_s {
-                        ui.add(egui::DragValue::new(e).clamp_range(0.0..=36_000.0).speed(0.1).suffix(" s"));
+                        drag_reset(ui, e, 0.0..=36_000.0, 0.1, "", " s", playhead.max(1.0));
                         if ui.small_button("playhead").clicked() { *e = playhead; }
                     }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Fade in");
-                    ui.add(egui::DragValue::new(&mut l.fade_in_s).clamp_range(0.0..=30.0).speed(0.05).suffix(" s"));
+                    drag_reset(ui, &mut l.fade_in_s, 0.0..=30.0, 0.05, "", " s", 0.0);
                     ui.label("out");
-                    ui.add(egui::DragValue::new(&mut l.fade_out_s).clamp_range(0.0..=30.0).speed(0.05).suffix(" s"));
+                    drag_reset(ui, &mut l.fade_out_s, 0.0..=30.0, 0.05, "", " s", 0.0);
                 });
                 ui.small("Tip: drag the layer's bar on the timeline, or press [ and ] to set its start / end at the playhead.");
             });
@@ -198,7 +198,7 @@ impl LayersUi {
                     fit_ui(ui, fit, offset, scale);
                     ui.checkbox(looping, "Loop");
                     ui.checkbox(mute, "Mute");
-                    ui.horizontal(|ui| { ui.label("Start inside clip"); ui.add(egui::DragValue::new(trim_start_s).clamp_range(0.0..=36_000.0).speed(0.1).suffix(" s")); });
+                    ui.horizontal(|ui| { ui.label("Start inside clip"); drag_reset(ui, trim_start_s, 0.0..=36_000.0, 0.1, "", " s", 0.0); });
                     ui.small("Video sound is mixed into the export only when un-muted and not looping.");
                 }
                 LayerKind::Text(t) => {
@@ -228,15 +228,35 @@ impl LayersUi {
                         if t.font_path.is_some() && ui.small_button("Reset").clicked() { t.font_path = None; }
                     });
 
-                    ui.horizontal(|ui| { ui.label("Size"); ui.add(egui::Slider::new(&mut t.size, 0.01..=0.4).text("of height")); });
+                    let d = TextLayer::default();
+                    ui.horizontal(|ui| { ui.label("Size"); slider_reset(ui, &mut t.size, 0.01..=0.4, "of height", d.size); });
                     ui.horizontal(|ui| {
-                        ui.label("Colour"); ui.color_edit_button_srgb(&mut t.color);
+                        ui.label("Colour"); color_reset(ui, &mut t.color, d.color);
                         for (a, n) in [(TextAlign::Left, "Left"), (TextAlign::Center, "Center"), (TextAlign::Right, "Right")] { ui.selectable_value(&mut t.align, a, n); }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Position");
-                        ui.add(egui::DragValue::new(&mut t.pos[0]).clamp_range(0.0..=1.0).speed(0.005).prefix("x "));
-                        ui.add(egui::DragValue::new(&mut t.pos[1]).clamp_range(0.0..=1.0).speed(0.005).prefix("y "));
+                        drag_reset(ui, &mut t.pos[0], 0.0..=1.0, 0.005, "x ", "", d.pos[0]);
+                        drag_reset(ui, &mut t.pos[1], 0.0..=1.0, 0.005, "y ", "", d.pos[1]);
+                    });
+
+                    egui::CollapsingHeader::new("Outline").default_open(t.outline_width > 0.0).show(ui, |ui| {
+                        slider_reset(ui, &mut t.outline_width, 0.0..=24.0, "Width", d.outline_width);
+                        ui.horizontal(|ui| { ui.label("Colour"); color_reset(ui, &mut t.outline_color, d.outline_color); });
+                        ui.small("Width is in canvas points (the short side of the canvas is 1080).");
+                    });
+                    egui::CollapsingHeader::new("Shadow").default_open(t.shadow).show(ui, |ui| {
+                        checkbox_reset(ui, &mut t.shadow, "Enabled", d.shadow);
+                        ui.add_enabled_ui(t.shadow, |ui| {
+                            ui.horizontal(|ui| { ui.label("Colour"); color_reset(ui, &mut t.shadow_color, d.shadow_color); });
+                            slider_reset(ui, &mut t.shadow_opacity, 0.0..=1.0, "Opacity", d.shadow_opacity);
+                            slider_reset(ui, &mut t.shadow_blur, 0.0..=24.0, "Softness", d.shadow_blur);
+                            ui.horizontal(|ui| {
+                                ui.label("Offset");
+                                drag_reset(ui, &mut t.shadow_offset[0], -60.0..=60.0, 0.2, "x ", "", d.shadow_offset[0]);
+                                drag_reset(ui, &mut t.shadow_offset[1], -60.0..=60.0, 0.2, "y ", "", d.shadow_offset[1]);
+                            });
+                        });
                     });
                 }
             }
@@ -265,13 +285,11 @@ fn fit_ui(ui: &mut egui::Ui, fit: &mut FitMode, offset: &mut [f32; 2], scale: &m
     });
     ui.horizontal(|ui| {
         ui.label("Scale");
-        ui.add(egui::Slider::new(scale, 0.05..=5.0).logarithmic(true).suffix("x"));
-        if ui.small_button("1x").clicked() { *scale = 1.0; }
+        log_slider_reset(ui, scale, 0.05..=5.0, "x", 1.0);
     });
     ui.horizontal(|ui| {
         ui.label("Offset");
-        ui.add(egui::DragValue::new(&mut offset[0]).clamp_range(-2.0..=2.0).speed(0.005).prefix("x "));
-        ui.add(egui::DragValue::new(&mut offset[1]).clamp_range(-2.0..=2.0).speed(0.005).prefix("y "));
-        if ui.small_button("Center").clicked() { *offset = [0.0, 0.0]; }
+        drag_reset(ui, &mut offset[0], -2.0..=2.0, 0.005, "x ", "", 0.0);
+        drag_reset(ui, &mut offset[1], -2.0..=2.0, 0.005, "y ", "", 0.0);
     });
 }

@@ -888,6 +888,8 @@ struct VisualizerApp {
     preview_settle: std::time::Instant,
     last_layers: Vec<project::Layer>,
     last_settings: Option<visualizer_core::export::RenderSettings>,
+    /// Which big fonts (CJK / Hangul) the visible text needs; they are loaded only then.
+    font_needs: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1102,6 +1104,7 @@ impl VisualizerApp {
             preview_settle: std::time::Instant::now(),
             last_layers: Vec::new(),
             last_settings: None,
+            font_needs: 0,
         }
     }
 
@@ -1433,7 +1436,7 @@ impl VisualizerApp {
 
     fn reload_custom_font(&mut self, ctx: &egui::Context) {
         let target = self.config.track_info.font_path.clone();
-        ctx.set_fonts(font_defs(&target));
+        ctx.set_fonts(font_defs(&target, self.font_needs));
         self.loaded_font_path = target;
     }
 
@@ -5413,9 +5416,9 @@ impl VisualizerApp {
 
 /// Font definitions for the track-info text (shared by the UI context and every offscreen job).
 /// System fallback fonts are appended so CJK / Arabic / Hebrew / Indic / Thai titles show real glyphs.
-fn font_defs(path: &Option<String>) -> egui::FontDefinitions {
+fn font_defs(path: &Option<String>, needs: u8) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    fonts::install_fallbacks(&mut fonts);
+    fonts::install_fallbacks(&mut fonts, needs);
     let mut names: Vec<String> = Vec::new();
     if let Some(p) = path {
         if let Ok(data) = std::fs::read(p) {
@@ -5493,7 +5496,6 @@ fn draw_checkerboard(p: &egui::Painter, r: egui::Rect) {
 
 const GUIDE_TITLE: egui::Color32 = egui::Color32::from_rgb(0, 220, 255);
 const GUIDE_ACTION: egui::Color32 = egui::Color32::from_rgb(255, 200, 0);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(150, 100, 255);
 
 fn draw_guides(p: &egui::Painter, r: egui::Rect, aspect: f32) {
     let action = egui::Rect::from_center_size(r.center(), r.size() * 0.95);
@@ -5522,6 +5524,7 @@ fn draw_guides(p: &egui::Painter, r: egui::Rect, aspect: f32) {
 impl VisualizerApp {
     fn set_mode(&mut self, ctx: &egui::Context, to: app_mode::WindowMode) {
         if to == self.mode { return; }
+        let from = self.mode;
         app_mode::transition(ctx, &mut self.overlay, self.mode, to, &self.win_prefs);
         if to == app_mode::WindowMode::Overlay {
             // `Overlay::attach` finds the window by this exact title.
@@ -5529,11 +5532,46 @@ impl VisualizerApp {
             self.project.reset_title();
         }
         self.mode = to;
+        if to == app_mode::WindowMode::Overlay { self.release_studio_memory(ctx); }
+        else if from == app_mode::WindowMode::Overlay { self.studio.reactivate(ctx); }
         self.win_prefs.mode = to;
         self.is_passthrough_set = false;
         self.settings_gate_since = None;
         lock_state(&self.shared).window_mode = to;
         self.win_prefs.save();
+    }
+
+    /// Which big fonts does the text that is currently shown need?
+    fn current_font_needs(&self) -> u8 {
+        use fonts::needs_of;
+        let mut n = 0;
+        if let Some(t) = &self.track_info { n |= needs_of(&t.title) | needs_of(&t.artist) | needs_of(&t.album); }
+        if self.mode != app_mode::WindowMode::Overlay {
+            for e in &self.studio.entries {
+                n |= needs_of(&e.meta.title) | needs_of(&e.meta.artist) | needs_of(&e.meta.album) | e.path.to_str().map(needs_of).unwrap_or(0);
+            }
+            for l in &self.project.doc.layers {
+                n |= needs_of(&l.name);
+                if let project::LayerKind::Text(t) = &l.kind { n |= needs_of(&t.text); }
+            }
+        }
+        n
+    }
+
+    /// Back to the desktop overlay: free everything the studio needed (decoded audio, analysis frames,
+    /// waveform, GPU render target, preview and layer textures, video decoders, big fonts).
+    fn release_studio_memory(&mut self, ctx: &egui::Context) {
+        self.studio.release();
+        if !self.queue.busy() { self.offscreen = None; } // dropping it deletes the GL objects
+        self.preview_comp = None;
+        self.preview_tex = None;
+        self.preview_key = None;
+        self.last_layers = Vec::new();
+        self.last_settings = None;
+        self.ui_hidden = false;
+        self.font_needs = self.current_font_needs();       // overlay: only the current track's scripts
+        self.loaded_font_path = Some("__reload__".to_string()); // force the font rebuild (drops the big fonts)
+        ctx.request_repaint();
     }
 
     /// Put an analysed file frame into the same fields the live path fills.
@@ -5621,7 +5659,12 @@ impl VisualizerApp {
             v.widgets.hovered.weak_bg_fill = g(44);
             v.widgets.active.bg_fill = g(64);
             v.widgets.active.weak_bg_fill = g(64);
-            v.selection.bg_fill = egui::Color32::from_rgb(88, 58, 170);
+            // same accent as the desktop overlay's settings window
+            v.selection.bg_fill = accent();
+            v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+            v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent());
+            v.widgets.active.bg_fill = accent();
+            v.widgets.active.weak_bg_fill = accent();
             for (_, f) in st.text_styles.iter_mut() { f.size = (f.size * 1.18).round(); }
             ctx.set_style(st);
         } else if let Some(prev) = self.overlay_style.take() {
@@ -5648,7 +5691,7 @@ impl VisualizerApp {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
             let r = ctx.screen_rect();
             p.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
-            p.rect_stroke(r.shrink(14.0), 8.0, egui::Stroke::new(3.0_f32, ACCENT));
+            p.rect_stroke(r.shrink(14.0), 8.0, egui::Stroke::new(3.0_f32, accent()));
             p.text(r.center(), egui::Align2::CENTER_CENTER, "Drop audio, image or video files to add them", egui::FontId::proportional(24.0), egui::Color32::WHITE);
         }
     }
@@ -5836,7 +5879,7 @@ impl VisualizerApp {
             if let Some(tex) = &self.preview_tex {
                 painter.image(tex.id(), fit, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             }
-            painter.rect_stroke(fit.expand(2.0), 0.0, egui::Stroke::new(2.0_f32, ACCENT));
+            painter.rect_stroke(fit.expand(2.0), 0.0, egui::Stroke::new(2.0_f32, accent()));
             if self.render_ui.show_guides { draw_guides(painter, fit, cw / ch); }
         }
         ok
@@ -5949,7 +5992,11 @@ impl render::Host for VisualizerApp {
 
         let font_path = self.config.track_info.font_path.clone(); // font of the EFFECTIVE config
         let extras = comp.font_extras(layers);
-        off.sync_fonts(&format!("{:?}", font_path), || font_defs(&font_path), &extras, params.logical);
+        // big CJK / Hangul fonts only when the text being drawn needs them
+        let mut needs = self.font_needs;
+        if let Some(m) = meta { needs |= fonts::needs_of(&m.title) | fonts::needs_of(&m.artist) | fonts::needs_of(&m.album); }
+        for l in layers { if let project::LayerKind::Text(t) = &l.kind { needs |= fonts::needs_of(&t.text); } }
+        off.sync_fonts(&format!("{:?}|{}", font_path, needs), || font_defs(&font_path, needs), &extras, params.logical);
         off.sync_cover(cover_key, cover);
 
         if let (Some(f), Some(x)) = (frame, fx) { self.apply_file_frame(f, x.clone()); } // None = keep the live bars
@@ -6030,8 +6077,16 @@ impl eframe::App for VisualizerApp {
             self.set_mode(ctx, m);
         }
         self.pump_render(ctx, gl.as_ref());
+        // back in the overlay with nothing rendering: give the GPU objects back
+        if self.mode == app_mode::WindowMode::Overlay && !self.queue.busy() && self.offscreen.is_some() { self.offscreen = None; }
         self.monitor_watch.poll(ctx, self.mode);
         self.apply_theme(ctx);
+        {
+            let fresh = self.current_font_needs();
+            // in the studio the set only grows (no reload thrash); in the overlay it follows the current track
+            let need = if self.mode == app_mode::WindowMode::Overlay { fresh } else { self.font_needs | fresh };
+            if need != self.font_needs { self.font_needs = need; self.loaded_font_path = Some("__reload__".to_string()); }
+        }
 
         let generation = self.config_gen.load(Ordering::Acquire);
         if generation != self.seen_gen {

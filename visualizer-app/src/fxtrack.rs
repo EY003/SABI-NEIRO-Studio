@@ -6,7 +6,7 @@
 //! checkpoint and replays at most CHECKPOINT_EVERY steps (microseconds).
 //! Export walks the steps in order and never needs checkpoints.
 
-use visualizer_core::audio::offline::AnalysisTrack;
+use visualizer_core::audio::offline::{AnalysisTrack, Keep};
 use visualizer_core::config::{AppConfig, AudioSettings, MotionSettings, ReactiveSettings};
 
 use crate::reactive::FxState;
@@ -91,4 +91,9 @@ impl FxCursor {
         }
         self.next = target + 1;
     }
+}
+
+/// Bulky per-frame arrays that the current look actually reads (the rest is dropped to save RAM).
+pub fn keep_for(cfg: &AppConfig) -> Keep {
+    Keep { waveform: cfg.reactive.wave_wiggle, instant: cfg.reactive.ghost_line }
 }
