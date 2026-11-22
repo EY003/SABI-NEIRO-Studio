@@ -977,7 +977,7 @@ impl VisualizerApp {
                 }
                 if rs.pitch_outline {
                     let r = self.bar_rect(dir, perp_start, bw, anchor, len);
-                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, col));
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5_f32, col));
                 }
             }
         }
