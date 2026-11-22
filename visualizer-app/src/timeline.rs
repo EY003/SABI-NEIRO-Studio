@@ -211,8 +211,14 @@ impl Timeline {
                 match self.drag {
                     Drag::Seek => out.seek = Some(t as f32),
                     Drag::Pan => self.t0 = (self.t0 - resp.drag_delta().x / w * self.len).clamp(0.0, (dur - self.len).max(0.0)),
-                    Drag::RangeIn => if let Some((_, b)) = *range { *range = Some((snap(t, None, true).min(b - 0.05).max(0.0), b)); },
-                    Drag::RangeOut => if let Some((a, _)) = *range { *range = Some((a, snap(t, None, true).max(a + 0.05).min(dur as f64))); },
+                    Drag::RangeIn => if let Some((_, b)) = *range {
+                        let a = snap(t, None, true).min(b - 0.05).max(0.0);
+                        *range = Some((a, b));
+                    },
+                    Drag::RangeOut => if let Some((a, _)) = *range {
+                        let b = snap(t, None, true).max(a + 0.05).min(dur as f64);
+                        *range = Some((a, b));
+                    },
                     Drag::RangeNew { anchor } => {
                         let (a, b) = (anchor.min(snap(t, None, true)), anchor.max(snap(t, None, true)));
                         if b - a > 0.05 { *range = Some((a, b)); }
@@ -238,12 +244,12 @@ impl Timeline {
                             if let Some(len) = len { l.end_s = Some(ns + len); }
                         }
                     }
-                   Drag::LayerStart(id) => {
-                        let snapped_t = snap(t, Some(id), false);
+                    Drag::LayerStart(id) => {
+                        let t = snap(t, Some(id), false); // snap BEFORE borrowing the layers mutably
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) {
                             l.start_s = t.min(l.end_s.unwrap_or(dur as f64) - 0.1).max(0.0);
                         }
-                    },
+                    }
                     Drag::LayerEnd(id) => {
                         let t = snap(t, Some(id), false);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) { l.end_s = Some(t.max(l.start_s + 0.1).min(dur as f64)); }
