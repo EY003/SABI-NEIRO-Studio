@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 use super::{downmix, AudioProcessor, BarFrame, DcBlocker};
 use crate::config::AudioSettings;
 
+/// Which bulky per-frame arrays to keep. `waveform` (4 KB/frame) is read only by the waveform-wiggle
+/// effect and `instant` only by the ghost line; dropping them cuts a stored frame from ~5.7 KB to ~1.2 KB.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Keep { pub waveform: bool, pub instant: bool }
+
 pub struct AnalysisTrack {
     pub frames: Vec<BarFrame>,
     pub rate_hz: f32,
@@ -22,6 +27,7 @@ pub struct AnalysisTrack {
     pub duration_s: f32,
     /// Settings the track was built with; compare with `==` to know when to rebuild.
     pub settings: AudioSettings,
+    pub keep: Keep,
 }
 
 /// Analysis rate for a given output fps: fps times the smallest integer that reaches
@@ -57,6 +63,7 @@ pub fn analyze(
     sample_rate: u32,
     settings: &AudioSettings,
     rate_hz: f32,
+    keep: Keep,
     cancel: &AtomicBool,
     mut progress: impl FnMut(f32),
 ) -> Option<AnalysisTrack> {
@@ -97,10 +104,13 @@ pub fn analyze(
             .process(&mono[start..end], settings, dt, at)
             .or_else(|| frames.last().cloned())
             .unwrap_or_else(|| BarFrame::zeros(settings.num_bars));
+        let mut frame = frame;
+        if !keep.waveform { frame.waveform = Vec::new(); }
+        if !keep.instant { frame.instant = Vec::new(); }
         frames.push(frame);
     }
     progress(1.0);
-    Some(AnalysisTrack { frames, rate_hz: rate, sample_rate, duration_s, settings: settings.clone() })
+    Some(AnalysisTrack { frames, rate_hz: rate, sample_rate, duration_s, settings: settings.clone(), keep })
 }
 
 #[cfg(test)]
@@ -123,8 +133,9 @@ mod tests {
             .collect();
         let st = AudioSettings::default();
         let cancel = AtomicBool::new(false);
-        let a = analyze(&s, 1, sr, &st, 60.0, &cancel, |_| {}).unwrap();
-        let b = analyze(&s, 1, sr, &st, 60.0, &cancel, |_| {}).unwrap();
+        let a = analyze(&s, 1, sr, &st, 60.0, Keep::default(), &cancel, |_| {}).unwrap();
+        let b = analyze(&s, 1, sr, &st, 60.0, Keep::default(), &cancel, |_| {}).unwrap();
+        assert!(a.frames[a.frames.len() / 2].waveform.is_empty());
         assert_eq!(a.frames.len(), b.frames.len());
         let mid = a.frames.len() / 2;
         assert_eq!(a.frames[mid].values, b.frames[mid].values);
