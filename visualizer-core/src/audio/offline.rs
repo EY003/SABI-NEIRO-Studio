@@ -30,6 +30,16 @@ pub struct AnalysisTrack {
     pub keep: Keep,
 }
 
+/// An analysis of pure silence (for spacers): zero frames, no FFT work.
+pub fn silent(duration_s: f32, rate_hz: f32, settings: &AudioSettings) -> AnalysisTrack {
+    let rate = rate_hz.max(1.0);
+    let steps = (duration_s.max(0.0) * rate).ceil() as usize + 1;
+    let mut z = BarFrame::zeros(settings.num_bars);
+    z.waveform = Vec::new();
+    z.instant = Vec::new();
+    AnalysisTrack { frames: vec![z; steps], rate_hz: rate, sample_rate: 48_000, duration_s, settings: settings.clone(), keep: Keep::default() }
+}
+
 /// Analysis rate for a given output fps: fps times the smallest integer that reaches
 /// >= 60 Hz (24 -> 72, 30 -> 60, 59.94 -> 59.94). Every output frame then lands exactly
 /// on an analysis step (step = frame * multiple), so render needs no interpolation.
