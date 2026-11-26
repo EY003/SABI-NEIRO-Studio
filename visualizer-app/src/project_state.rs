@@ -466,5 +466,9 @@ impl ProjectState {
 }
 
 fn same_audio(a: &[AudioItem], b: &[AudioItem]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.media.path == y.media.path)
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| {
+        x.media.path == y.media.path
+            && x.silence_s.map(|v| (v * 1000.0) as i64) == y.silence_s.map(|v| (v * 1000.0) as i64)
+            && x.look.as_ref().map(|l| l.rev) == y.look.as_ref().map(|l| l.rev)
+    })
 }

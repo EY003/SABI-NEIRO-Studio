@@ -890,6 +890,12 @@ struct VisualizerApp {
     last_settings: Option<visualizer_core::export::RenderSettings>,
     /// Which big fonts (CJK / Hangul) the visible text needs; they are loaded only then.
     font_needs: u8,
+    /// Selected track for which the (project or own) visualizer settings were last applied.
+    look_sel: Option<u64>,
+    /// The next settings-generation bump is our own doing, not a user edit.
+    expect_cfg_echo: bool,
+    /// Dropped video files waiting for the user to choose how to use them.
+    pending_video_drop: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1105,6 +1111,9 @@ impl VisualizerApp {
             last_layers: Vec::new(),
             last_settings: None,
             font_needs: 0,
+            look_sel: None,
+            expect_cfg_echo: false,
+            pending_video_drop: Vec::new(),
         }
     }
 
@@ -5591,19 +5600,52 @@ impl VisualizerApp {
         self.fx = fx;
     }
 
-    /// Push a project document into the live state (open / undo / redo / preset / relink / recovery).
-    fn apply_doc(&mut self, ctx: &egui::Context, doc: &project::ProjectDoc) {
+    /// Make `cfg` the live visualizer settings (settings window and preview), without counting as a user edit.
+    fn push_config(&mut self, cfg: AppConfig) {
         {
             let mut st = lock_state(&self.shared);
-            st.config = doc.config.clone();
-            st.last_fingerprint = config_fingerprint(&doc.config);
+            st.config = cfg.clone();
+            st.last_fingerprint = config_fingerprint(&cfg);
             st.audio_dirty = true;
         }
-        self.config_gen.fetch_add(1, Ordering::Release); // update() copies st.config into self.config
+        self.config = cfg;                 // effective immediately; update() copies it again next frame
+        self.expect_cfg_echo = true;
+        self.config_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// The Audio tab's "visualizer settings of this track" section.
+    fn ui_track_look(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Visualizer settings");
+        if self.studio.selected_index().is_none() { ui.small("Select a track to give it its own settings."); return; }
+        if self.studio.selected_is_spacer() { ui.small("A spacer is silent: there is nothing to visualize."); return; }
+        let has = self.studio.selected_look().is_some();
+        let mut own = has;
+        if ui.checkbox(&mut own, "This track has its own visualizer settings")
+            .on_hover_text("Off: the track uses the project look (shared by every track without its own).\nOn: the Settings window edits only this track, so every track can look different.").changed() {
+            if own { self.studio.set_selected_look(Some(self.config.clone())); } // starts as a copy of what you see now
+            else { self.studio.set_selected_look(None); let g = self.project.doc.config.clone(); self.push_config(g); }
+        }
+        ui.small(if has { "Changes in the Settings window now affect only this track." } else { "Changes in the Settings window affect every track without its own settings." });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Open Settings").clicked() { self.settings_open.store(true, Ordering::Relaxed); }
+            if has && ui.button("Reset to the project look").clicked() {
+                let g = self.project.doc.config.clone();
+                self.studio.set_selected_look(Some(g.clone()));
+                self.push_config(g);
+            }
+        });
+    }
+
+    /// Push a project document into the live state (open / undo / redo / preset / relink / recovery).
+    fn apply_doc(&mut self, ctx: &egui::Context, doc: &project::ProjectDoc) {
         self.render_ui.settings = doc.render.clone();
         self.studio.fps = doc.render.fps;
         let dir = self.project.dir();
         self.studio.set_audio(ctx, &doc.audio, &dir);
+        let eff = self.studio.selected_look().map(|l| l.config.clone()).unwrap_or_else(|| doc.config.clone());
+        self.push_config(eff);
+        self.look_sel = self.studio.selected;
         self.layers_ui.selected = None;
     }
 
@@ -5680,10 +5722,14 @@ impl VisualizerApp {
             let dir = self.project.dir_opt();
             let mut audio = Vec::new();
             for p in files {
-                if layers_ui::media_kind(&p).is_some() {
-                    self.layers_ui.add_media(&mut self.project.doc, &p, dir.as_deref());
-                    self.sidebar_tab = SidebarTab::Layers;
-                } else { audio.push(p); }
+                match layers_ui::media_kind(&p) {
+                    Some(layers_ui::MediaKind::Video) => self.pending_video_drop.push(p), // asked below
+                    Some(_) => {
+                        self.layers_ui.add_media(&mut self.project.doc, &p, dir.as_deref());
+                        self.sidebar_tab = SidebarTab::Layers;
+                    }
+                    None => audio.push(p),
+                }
             }
             if !audio.is_empty() { self.studio.add_files(ctx, audio); self.sidebar_tab = SidebarTab::Audio; }
         }
@@ -5693,6 +5739,47 @@ impl VisualizerApp {
             p.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
             p.rect_stroke(r.shrink(14.0), 8.0, egui::Stroke::new(3.0_f32, accent()));
             p.text(r.center(), egui::Align2::CENTER_CENTER, "Drop audio, image or video files to add them", egui::FontId::proportional(24.0), egui::Color32::WHITE);
+        }
+    }
+
+    /// A video was dropped: background picture, audio source for the visualizer, or both?
+    fn ask_video_use(&mut self, ctx: &egui::Context) {
+        if self.pending_video_drop.is_empty() { return; }
+        let name = self.pending_video_drop[0].file_name().and_then(|n| n.to_str()).unwrap_or("video").to_string();
+        let more = self.pending_video_drop.len() - 1;
+        let mut choice = 0;
+        egui::Window::new("Add video").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            let w = 360.0;
+            ui_util::clipped_label(ui, &name, w, false, None);
+            if more > 0 { ui.small(format!("(and {more} more)")); }
+            ui.label("How do you want to use it?");
+            if ui.add_sized([w, 28.0], egui::Button::new("Background layer (the picture)")).clicked() { choice = 1; }
+            if ui.add_sized([w, 28.0], egui::Button::new("Audio source (its sound drives the visualizer)")).clicked() { choice = 2; }
+            if ui.add_sized([w, 28.0], egui::Button::new("Both (picture and sound of the same video)")).clicked() { choice = 3; }
+            if ui.add_sized([w, 24.0], egui::Button::new("Cancel")).clicked() { choice = 4; }
+            if !self.studio.ffmpeg.is_some() { ui.small("ffmpeg is still being located; the sound is added as soon as it is found."); }
+        });
+        if choice == 0 { return; }
+        let files = std::mem::take(&mut self.pending_video_drop);
+        let dir = self.project.dir_opt();
+        for p in files {
+            if choice == 1 || choice == 3 {
+                // for "both" the picture starts where the new track starts (end of the timeline in sequence mode)
+                let start = if choice == 3 && self.studio.sequence { self.studio.total_duration_s() as f64 } else { 0.0 };
+                if self.layers_ui.add_media(&mut self.project.doc, &p, dir.as_deref()) && choice == 3 {
+                    if let Some(id) = self.layers_ui.selected {
+                        if let Some(l) = self.project.doc.layers.iter_mut().find(|l| l.id == id) {
+                            l.start_s = start;
+                            if let project::LayerKind::Video { looping, .. } = &mut l.kind { *looping = false; }
+                        }
+                    }
+                }
+                self.sidebar_tab = SidebarTab::Layers;
+            }
+            if choice == 2 || choice == 3 {
+                self.studio.add_files(ctx, vec![p]);
+                if choice == 2 { self.sidebar_tab = SidebarTab::Audio; }
+            }
         }
     }
 
@@ -5713,6 +5800,7 @@ impl VisualizerApp {
                         let mut seq = self.render_ui.settings.sequence;
                         self.studio.ui_audio(ui, ctx, &mut seq);
                         self.render_ui.settings.sequence = seq;
+                        self.ui_track_look(ui);
                     }
                     SidebarTab::Layers => {
                         let pos = self.studio.global_pos_s() as f64;
@@ -5889,9 +5977,20 @@ impl VisualizerApp {
     fn update_windowed(&mut self, ctx: &egui::Context, gl: Option<Arc<glow::Context>>) {
         if self.mode == app_mode::WindowMode::Window { self.win_prefs.remember(ctx); }
         self.handle_dropped(ctx);
+        self.ask_video_use(ctx);
         self.studio.handle_input(ctx);
         self.studio.sequence = self.render_ui.settings.sequence;
+        self.render_ui.ensure_caps();
+        self.studio.set_ffmpeg(ctx, self.render_ui.ffmpeg_path());
         self.studio.poll(ctx, &self.config);
+
+        // The selected track decides which visualizer settings are live (its own, or the project look).
+        // This also switches the look automatically when playback moves on to the next track.
+        if self.studio.selected != self.look_sel {
+            self.look_sel = self.studio.selected;
+            let eff = self.studio.selected_look().map(|l| l.config.clone()).unwrap_or_else(|| self.project.doc.config.clone());
+            if config_fingerprint(&eff) != config_fingerprint(&self.config) { self.push_config(eff); }
+        }
         self.studio.fps = self.render_ui.settings.fps; // analysis rate follows the export frame rate
 
         // keyboard: Ctrl+R render panel, Tab hide/show panels, [ and ] trim the selected layer at the playhead
@@ -5934,11 +6033,13 @@ impl VisualizerApp {
             let dir_opt = self.project.dir_opt();
             self.layers_ui.poll(&mut self.project.doc, dir_opt.as_deref());
             self.ui_sidebar(ctx);
+            if let Some(p) = self.layers_ui.audio_from_video.take() { self.studio.add_files(ctx, vec![p]); self.sidebar_tab = SidebarTab::Audio; }
             self.studio.ui_bottom(ctx, &mut self.render_ui.settings.range, &mut self.project.doc.layers, &mut self.layers_ui.selected);
             if self.render_ui.open {
                 let (layers, dir) = (self.project.doc.layers.clone(), self.project.dir());
                 let extra = compose::layer_issues(&layers, &dir, self.render_ui.ffmpeg_path().is_some());
-                self.render_ui.ui(ctx, &self.studio, &self.config, &mut self.queue, &layers, &dir, &extra);
+                let project_cfg = self.project.doc.config.clone();
+                self.render_ui.ui(ctx, &self.studio, &project_cfg, &mut self.queue, &layers, &dir, &extra);
             } else {
                 self.render_ui.ui(ctx, &self.studio, &self.config, &mut self.queue, &[], std::path::Path::new(""), &[]);
             }
@@ -5951,7 +6052,11 @@ impl VisualizerApp {
         }
 
         // Record undo steps / dirty state once per frame, after every panel had its say.
-        let cfg_fp = if std::mem::take(&mut self.config_changed_flag) { Some(config_fingerprint(&self.config)) } else { None };
+        // A settings edit belongs to the selected track if it has its own settings, otherwise to the project look.
+        let cfg_edit = std::mem::take(&mut self.config_changed_flag);
+        let own_look = self.studio.selected_look().is_some();
+        if cfg_edit && own_look { self.studio.store_selected_look(&self.config); }
+        let cfg_fp = if cfg_edit && !own_look { Some(config_fingerprint(&self.config)) } else { None };
         let audio_changed = self.studio.list_gen != self.project.list_gen_seen;
         let audio = if audio_changed { self.studio.audio_items(self.project.dir_opt().as_deref()) } else { Vec::new() };
         self.project.tick(ctx, &self.config, cfg_fp, &self.render_ui.settings, &audio, audio_changed);
@@ -6091,7 +6196,8 @@ impl eframe::App for VisualizerApp {
         let generation = self.config_gen.load(Ordering::Acquire);
         if generation != self.seen_gen {
             self.seen_gen = generation;
-            self.config_changed_flag = true;
+            // our own `push_config` bumps the generation too; that is not a user edit
+            if std::mem::take(&mut self.expect_cfg_echo) { self.config_changed_flag = false; } else { self.config_changed_flag = true; }
             let mut st = lock_state(&self.shared);
             self.config = st.config.clone();
             match st.fx_reset {

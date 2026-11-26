@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -332,6 +332,9 @@ pub struct Job {
     /// Sequence mode: every file with its place on the timeline (empty = single file).
     pub segments: Vec<ex::AudioSeg>,
     first_seg: usize,
+    /// Sequence mode: visualizer settings of each segment (`None` = the job's base settings).
+    seg_cfgs: Vec<Option<AppConfig>>,
+    base_cfg: Box<AppConfig>,
     pub cfg: Box<AppConfig>,
     pub settings: RenderSettings,
     pub ffmpeg: PathBuf,
@@ -382,12 +385,17 @@ fn hash_path(p: &std::path::Path) -> u64 {
     h.finish()
 }
 
-/// Decode + analyse one audio file on a worker thread.
-fn spawn_prepare(path: PathBuf, cfg: AudioSettings, rate: f32, keep: offline::Keep, cancel: Arc<AtomicBool>, ctx: egui::Context) -> Receiver<PrepMsg> {
+/// Decode + analyse one audio file on a worker thread (`silent_len` = a spacer: generated silence).
+fn spawn_prepare(path: PathBuf, silent_len: Option<f32>, cfg: AudioSettings, rate: f32, keep: offline::Keep,
+                 ffmpeg: Option<PathBuf>, cancel: Arc<AtomicBool>, ctx: egui::Context) -> Receiver<PrepMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let res = (|| -> Result<Prepared, String> {
-            let d = decode::decode_file(&path, &cancel).map_err(|e| e.to_string())?;
+            if let Some(len) = silent_len {
+                let tr = offline::silent(len, rate, &cfg);
+                return Ok(Prepared { tr, meta: TrackMeta::default(), cover: None, cover_small: None, cover_key: 0, duration_s: len });
+            }
+            let d = decode::decode_any(&path, ffmpeg.as_deref(), &cancel).map_err(|e| e.to_string())?;
             let txp = tx.clone();
             let tr = offline::analyze(&d.samples, d.channels, d.sample_rate, &cfg, rate, keep, &cancel, |p| { let _ = txp.send(PrepMsg::Progress(p)); })
                 .ok_or_else(|| "Cancelled".to_string())?;
@@ -407,6 +415,20 @@ fn spawn_prepare(path: PathBuf, cfg: AudioSettings, rate: f32, keep: offline::Ke
     rx
 }
 
+/// The visualizer settings that apply to segment `idx` (its own look, or the job's base settings).
+fn pick_cfg(seg_cfgs: &[Option<AppConfig>], base: &AppConfig, idx: usize) -> AppConfig {
+    seg_cfgs.get(idx).and_then(|c| c.clone()).unwrap_or_else(|| base.clone())
+}
+
+/// Start preparing segment `idx` (used for the prefetch of the next track).
+fn prep_next(segments: &[ex::AudioSeg], seg_cfgs: &[Option<AppConfig>], base: &AppConfig, idx: usize, fps: f32,
+             ffmpeg: &Path, cancel: &Arc<AtomicBool>, ctx: &egui::Context) -> Receiver<PrepMsg> {
+    let g = &segments[idx];
+    let cfg = pick_cfg(seg_cfgs, base, idx);
+    spawn_prepare(g.path.clone(), g.silent.then_some(g.dur_s as f32), cfg.audio.clone(), analysis_rate_for_fps(fps),
+                  crate::fxtrack::keep_for(&cfg), Some(ffmpeg.to_path_buf()), cancel.clone(), ctx.clone())
+}
+
 impl Job {
     pub fn is_active(&self) -> bool { matches!(self.state, JobState::Preparing | JobState::Rendering | JobState::Finishing) }
     pub fn is_finished(&self) -> bool { matches!(self.state, JobState::Done | JobState::Failed(_) | JobState::Cancelled) }
@@ -419,11 +441,12 @@ impl Job {
     }
 
     /// Which file to prepare first (sequence: the one containing the range start).
-    fn first_segment(&self) -> (PathBuf, usize) {
-        if self.segments.is_empty() { return (self.audio.clone(), 0); }
+    fn first_segment(&self) -> (PathBuf, usize, Option<f32>) {
+        if self.segments.is_empty() { return (self.audio.clone(), 0, None); }
         let t0 = self.settings.range.map(|r| r.0).unwrap_or(0.0);
         let i = self.segments.iter().position(|g| t0 < g.start_s + g.dur_s).unwrap_or(0);
-        (self.segments[i].path.clone(), i)
+        let g = &self.segments[i];
+        (g.path.clone(), i, g.silent.then_some(g.dur_s as f32))
     }
     fn total_len_s(&self, prep: &Prepared) -> f64 {
         self.segments.last().map(|g| g.start_s + g.dur_s).unwrap_or(prep.duration_s as f64)
@@ -433,10 +456,12 @@ impl Job {
         self.state = JobState::Preparing;
         self.progress = 0.0;
         self.cancel = Arc::new(AtomicBool::new(false));
-        let (path, first) = self.first_segment();
+        let (path, first, silent) = self.first_segment();
         self.first_seg = first;
+        *self.cfg = pick_cfg(&self.seg_cfgs, &self.base_cfg, first); // this track's own visualizer settings
         self.note("preparing (decode + analysis)");
-        self.prep_rx = Some(spawn_prepare(path, self.cfg.audio.clone(), analysis_rate_for_fps(self.settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
+        self.prep_rx = Some(spawn_prepare(path, silent, self.cfg.audio.clone(), analysis_rate_for_fps(self.settings.fps),
+            crate::fxtrack::keep_for(&self.cfg), Some(self.ffmpeg.clone()), self.cancel.clone(), ctx.clone()));
     }
 
     fn start_encode(&mut self, prep: Prepared) {
@@ -448,7 +473,7 @@ impl Job {
         let part = self.out_path.with_extension(format!("{ext}.part"));
         let extras = compose::extra_audio(&self.layers, &self.project_dir, start, end);
         let audio_segs: Vec<ex::AudioSeg> = if self.segments.is_empty() {
-            vec![ex::AudioSeg { path: self.audio.clone(), start_s: 0.0, dur_s: prep.duration_s as f64 }]
+            vec![ex::AudioSeg { path: self.audio.clone(), start_s: 0.0, dur_s: prep.duration_s as f64, silent: false }]
         } else { self.segments.clone() };
         let args = ex::build_args(&self.settings, &audio_segs, &part, start, dur, &extras);
         self.note(format!("ffmpeg {}", args.join(" ")));
@@ -626,8 +651,7 @@ impl Job {
             if !self.segments.is_empty() && run.seg_idx + 1 < self.segments.len() {
                 if t >= run.seg_end_s - 1e-6 {
                     if run.next_prep.is_none() {
-                        run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
-                            analysis_rate_for_fps(settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
+                        run.next_prep = Some(prep_next(&self.segments, &self.seg_cfgs, &self.base_cfg, run.seg_idx + 1, settings.fps, &self.ffmpeg, &self.cancel, ctx));
                     }
                     let mut ready: Option<Result<Prepared, String>> = None;
                     if let Some(rx) = &run.next_prep {
@@ -636,6 +660,7 @@ impl Job {
                     match ready {
                         Some(Ok(p)) => {
                             let g = &self.segments[run.seg_idx + 1];
+                            *self.cfg = pick_cfg(&self.seg_cfgs, &self.base_cfg, run.seg_idx + 1); // the next track's own look
                             run.palettes = crate::compute_palettes_sync(&self.cfg, p.cover_small.as_ref());
                             run.seg_idx += 1;
                             run.seg_start_s = g.start_s;
@@ -650,8 +675,7 @@ impl Job {
                     }
                 } else if run.next_prep.is_none() && t >= run.seg_end_s - 12.0 {
                     // prefetch shortly before the switch so the render does not stall
-                    run.next_prep = Some(spawn_prepare(self.segments[run.seg_idx + 1].path.clone(), self.cfg.audio.clone(),
-                        analysis_rate_for_fps(settings.fps), crate::fxtrack::keep_for(&self.cfg), self.cancel.clone(), ctx.clone()));
+                    run.next_prep = Some(prep_next(&self.segments, &self.seg_cfgs, &self.base_cfg, run.seg_idx + 1, settings.fps, &self.ffmpeg, &self.cancel, ctx));
                 }
             }
             let rate = run.prep.tr.rate_hz as f64;
@@ -701,11 +725,12 @@ impl RenderQueue {
     }
 
     pub fn add(&mut self, title: String, audio: PathBuf, cfg: AppConfig, settings: RenderSettings, ffmpeg: PathBuf, out_path: PathBuf,
-               layers: Vec<Layer>, project_dir: PathBuf, segments: Vec<ex::AudioSeg>) -> u64 {
+               layers: Vec<Layer>, project_dir: PathBuf, segments: Vec<ex::AudioSeg>, seg_cfgs: Vec<Option<AppConfig>>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let comp = Compositor::new(Mode::Export, Some(ffmpeg.clone()), settings.fps, 3840, settings.hw_decode);
-        let mut j = Job { id, title, audio, segments, first_seg: 0, cfg: Box::new(cfg), settings, ffmpeg, layers, project_dir, comp, out_path, state: JobState::Queued, progress: 0.0,
+        let base_cfg = Box::new(cfg.clone());
+        let mut j = Job { id, title, audio, segments, first_seg: 0, seg_cfgs, base_cfg, cfg: Box::new(cfg), settings, ffmpeg, layers, project_dir, comp, out_path, state: JobState::Queued, progress: 0.0,
             eta_s: None, elapsed_s: 0.0, attempts: 0, log: vec![], cancel: Arc::new(AtomicBool::new(false)), prep_rx: None, run: None };
         j.note("queued");
         self.jobs.push(j);

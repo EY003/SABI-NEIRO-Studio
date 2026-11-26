@@ -60,6 +60,17 @@ impl RenderUi {
                folder_rx: None, issues: vec![], checked_at: None, checked_for: None, log_job: None }
     }
 
+    /// Find ffmpeg once, in the background (called every frame; cheap).
+    pub fn ensure_caps(&mut self) {
+        if self.caps_rx.is_none() && self.caps.is_none() && self.caps_err.is_none() { self.start_probe(); }
+        if let Some(rx) = &self.caps_rx {
+            if let Ok(r) = rx.try_recv() {
+                match r { Ok(c) => self.caps = Some(c), Err(e) => self.caps_err = Some(e) }
+                self.caps_rx = None;
+            }
+        }
+    }
+
     pub fn ffmpeg_path(&self) -> Option<PathBuf> { self.caps.as_ref().map(|c| c.path.clone()) }
 
     fn save_if_changed(&mut self) {
@@ -92,14 +103,8 @@ impl RenderUi {
 
     pub fn ui(&mut self, ctx: &egui::Context, studio: &Studio, cfg: &AppConfig, queue: &mut RenderQueue,
               layers: &[Layer], project_dir: &Path, extra: &[Issue]) {
+        self.ensure_caps();
         if !self.open { self.save_if_changed(); return; }
-        if self.caps_rx.is_none() && self.caps.is_none() && self.caps_err.is_none() { self.start_probe(); }
-        if let Some(rx) = &self.caps_rx {
-            if let Ok(r) = rx.try_recv() {
-                match r { Ok(c) => self.caps = Some(c), Err(e) => self.caps_err = Some(e) }
-                self.caps_rx = None;
-            }
-        }
         if let Some(rx) = &self.folder_rx {
             if let Ok(p) = rx.try_recv() { self.settings.output_dir = p; self.folder_rx = None; }
         }
@@ -263,7 +268,7 @@ impl RenderUi {
         ui.small("Tokens: {artist} {title} {n}");
 
         // ── preflight (throttled: it touches the disk) ──
-        let entry = studio.selected_entry();
+        let entry = studio.selected_entry().filter(|e| !e.spacer);
         let audio = entry.map(|e| e.path.clone());
         let key = (self.settings.clone(), audio.clone());
         let stale = self.checked_for.as_ref() != Some(&key) || self.checked_at.map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true);
@@ -273,12 +278,13 @@ impl RenderUi {
                 match studio.sequence_segments() {
                     Some(segs) => {
                         let total = segs.last().map(|g| g.start_s + g.dur_s).unwrap_or(0.0) as f32;
-                        let (t0, a0) = studio.entries.first().map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
+                        let (t0, a0) = studio.entries.iter().find(|e| !e.spacer).map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
                         let out = output_path(&self.settings, &t0, &a0, 1);
-                        self.issues = preflight(&PreflightInput { settings: &self.settings, caps: self.caps.as_ref(), audio_path: &segs[0].path,
+                        let first_file = segs.iter().find(|g| !g.silent).map(|g| g.path.clone()).unwrap_or_default();
+                        self.issues = preflight(&PreflightInput { settings: &self.settings, caps: self.caps.as_ref(), audio_path: &first_file,
                             audio_duration_s: Some(total), free_bytes: free_bytes(&self.settings.output_dir), out_path: &out });
                         for g in &segs {
-                            if !g.path.is_file() { self.issues.push(Issue { severity: Severity::Error, message: format!("Track is missing: {}", g.path.display()) }); }
+                            if !g.silent && !g.path.is_file() { self.issues.push(Issue { severity: Severity::Error, message: format!("Track is missing: {}", g.path.display()) }); }
                         }
                     }
                     None => self.issues.push(Issue { severity: Severity::Error, message: "One timeline: wait until every track shows its length (or remove the one that failed).".into() }),
@@ -314,21 +320,30 @@ impl RenderUi {
         }
 
         // ── actions ──
+        // `cfg` is the PROJECT look; a track with its own settings overrides it for its own video / segment.
         ui.horizontal(|ui| {
             let ready = !has_error && self.caps.is_some();
             if self.settings.sequence {
                 if ui.add_enabled(ready, egui::Button::new("Add the whole sequence to queue")).clicked() {
                     if let Some(segs) = studio.sequence_segments() {
-                        let (t0, a0) = studio.entries.first().map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
-                        self.enqueue(queue, cfg, t0, a0, segs[0].path.clone(), 1, true, layers, project_dir, segs);
+                        let (t0, a0) = studio.entries.iter().find(|e| !e.spacer).map(|e| (e.meta.title.clone(), e.meta.artist.clone())).unwrap_or_default();
+                        let first_file = segs.iter().find(|g| !g.silent).map(|g| g.path.clone()).unwrap_or_default();
+                        let seg_cfgs: Vec<Option<AppConfig>> = studio.entries.iter().map(|e| e.look.as_ref().map(|l| l.config.clone())).collect();
+                        self.enqueue(queue, cfg, t0, a0, first_file, 1, true, layers, project_dir, segs, seg_cfgs, None);
                     }
                 }
             } else {
                 if ui.add_enabled(ready, egui::Button::new("Add to queue")).clicked() {
-                    if let Some(e) = entry { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), 1, true, layers, project_dir, Vec::new()); }
+                    if let Some(e) = entry {
+                        let own = e.look.as_ref().map(|l| l.config.clone());
+                        self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), 1, true, layers, project_dir, Vec::new(), Vec::new(), own);
+                    }
                 }
-                if ui.add_enabled(self.caps.is_some() && !studio.entries.is_empty(), egui::Button::new("Queue all tracks (one video each)")).on_hover_text("Uses the settings above for every audio file (range ignored)").clicked() {
-                    for (n, e) in studio.entries.iter().enumerate() { self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), n + 1, false, layers, project_dir, Vec::new()); }
+                if ui.add_enabled(self.caps.is_some() && !studio.entries.is_empty(), egui::Button::new("Queue all tracks (one video each)")).on_hover_text("Each track uses its own visualizer settings if it has any, otherwise the project look. The time range is ignored.").clicked() {
+                    for (n, e) in studio.entries.iter().filter(|e| !e.spacer).enumerate() {
+                        let own = e.look.as_ref().map(|l| l.config.clone());
+                        self.enqueue(queue, cfg, e.meta.title.clone(), e.meta.artist.clone(), e.path.clone(), n + 1, false, layers, project_dir, Vec::new(), Vec::new(), own);
+                    }
                 }
             }
         });
@@ -417,13 +432,13 @@ impl RenderUi {
     }
 
     fn enqueue(&mut self, queue: &mut RenderQueue, cfg: &AppConfig, title: String, artist: String, audio: PathBuf, n: usize, with_range: bool,
-               layers: &[Layer], project_dir: &Path, segments: Vec<AudioSeg>) {
+               layers: &[Layer], project_dir: &Path, segments: Vec<AudioSeg>, seg_cfgs: Vec<Option<AppConfig>>, own: Option<AppConfig>) {
         let Some(caps) = &self.caps else { return };
         let mut s = self.settings.clone();
         if !with_range { s.range = None; }
         let out = resolve_collision(output_path(&s, &title, &artist, n), s.collision, &queue.taken_paths());
         let label = if !segments.is_empty() { format!("Sequence of {} tracks: {}", segments.len(), title) }
                     else if artist.is_empty() { title } else { format!("{artist} - {title}") };
-        queue.add(label, audio, cfg.clone(), s, caps.path.clone(), out, layers.to_vec(), project_dir.to_path_buf(), segments);
+        queue.add(label, audio, own.unwrap_or_else(|| cfg.clone()), s, caps.path.clone(), out, layers.to_vec(), project_dir.to_path_buf(), segments, seg_cfgs);
     }
 }

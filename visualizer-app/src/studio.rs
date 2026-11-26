@@ -17,7 +17,7 @@ use visualizer_core::audio::BarFrame;
 use visualizer_core::config::{AppConfig, AudioSettings, ReactiveSettings};
 use visualizer_core::decode::{self, DecodeError, TrackMeta};
 use visualizer_core::musicbee::TrackInfo;
-use visualizer_core::project::{AudioItem, MediaRef};
+use visualizer_core::project::{AudioItem, MediaRef, TrackLook};
 use visualizer_core::playback::{Player, Track};
 use visualizer_core::waveform::Waveform;
 
@@ -27,7 +27,10 @@ use crate::fxtrack::{FxCursor, FxTrack};
 use crate::timeline::{self, Timeline};
 use crate::reactive::FxState;
 
-const EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "mp4"];
+/// Audio files, plus video files whose sound is analysed (through ffmpeg). Formats symphonia cannot
+/// read (opus, wma, ac3 ...) also go through ffmpeg.
+const EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "opus", "wma", "aif", "aiff", "ac3", "mka",
+                        "mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts"];
 
 #[derive(Clone, Debug)]
 pub enum Status { Pending, Loading, Analyzing, Ready, Failed(String) }
@@ -38,9 +41,14 @@ pub struct Entry {
     pub meta: TrackMeta,
     pub duration: Option<f32>,
     pub status: Status,
+    /// A silent spacer between tracks (no file; `duration` is its length).
+    pub spacer: bool,
+    /// This track's own visualizer settings (`None` = the project-wide look).
+    pub look: Option<TrackLook>,
 }
 impl Entry {
     fn display(&self) -> String {
+        if self.spacer { return format!("Spacer ({:.1} s of silence)", self.duration.unwrap_or(0.0)); }
         if self.meta.artist.is_empty() { self.meta.title.clone() }
         else { format!("{} - {}", self.meta.artist, self.meta.title) }
     }
@@ -58,7 +66,7 @@ enum Msg {
     Failed { gen: u64, err: String },
 }
 
-enum Action { Select(u64), Remove(u64), Move(u64, i32) }
+enum Action { Select(u64), Remove(u64), Move(u64, i32), SpacerLen(u64, f32) }
 
 /// What the floating bar (shown while the panels are hidden) asked for.
 pub enum OverlayAct { ShowPanels, ExitFullscreen }
@@ -91,6 +99,10 @@ pub struct Studio {
     timeline: Timeline,
     /// All tracks form ONE timeline (set by the app from the render settings).
     pub sequence: bool,
+    /// Path of ffmpeg (set by the app once found): needed for video files and exotic audio formats.
+    pub ffmpeg: Option<PathBuf>,
+    /// A spacer's length was edited; the loaded silence is rebuilt once the mouse is released.
+    spacer_dirty: Option<u64>,
     pending_seek: Option<f32>,
     mark_in: bool,
     mark_out: bool,
@@ -98,11 +110,12 @@ pub struct Studio {
     cursor_visible: bool,
 }
 
-/// Metadata + length. Some containers (VBR mp3 without a header) declare no length: decode once to measure it.
-fn probe_with_duration(path: &std::path::Path) -> Result<(TrackMeta, Option<f32>), String> {
-    let (meta, dur) = decode::probe_file(path).map_err(|e| e.to_string())?;
+/// Metadata + length. Video files and formats symphonia cannot read go through ffmpeg; containers that
+/// declare no length (VBR mp3 ...) are decoded once to measure it.
+fn probe_with_duration(path: &std::path::Path, ffmpeg: Option<&std::path::Path>) -> Result<(TrackMeta, Option<f32>), String> {
+    let (meta, dur) = decode::probe_any(path, ffmpeg)?;
     if dur.is_some() { return Ok((meta, dur)); }
-    let d = decode::decode_file(path, &AtomicBool::new(false)).map_err(|e| e.to_string())?;
+    let d = decode::decode_any(path, ffmpeg, &AtomicBool::new(false)).map_err(|e| e.to_string())?;
     Ok((meta, Some(d.duration_s())))
 }
 
@@ -121,7 +134,7 @@ impl Studio {
             want_play: false, autoplay_next: true, fps: 60.0,
             seen_audio: None, seen_reactive: None, stale_since: None,
             pending_track_info: None, log: vec![], list_gen: 0,
-            timeline: Timeline::new(), sequence: false, pending_seek: None, mark_in: false, mark_out: false, last_mouse: Instant::now(), cursor_visible: true,
+            timeline: Timeline::new(), sequence: false, ffmpeg: None, spacer_dirty: None, pending_seek: None, mark_in: false, mark_out: false, last_mouse: Instant::now(), cursor_visible: true,
         }
     }
 
@@ -153,7 +166,7 @@ impl Studio {
             }
             let id = self.next_id;
             self.next_id += 1;
-            self.entries.push(Entry { id, path: path.clone(), meta: TrackMeta::default(), duration: None, status: Status::Pending });
+            self.entries.push(Entry { id, path: path.clone(), meta: TrackMeta::default(), duration: None, status: Status::Pending, spacer: false, look: None });
             self.list_gen += 1;
             self.spawn_probe(ctx, id, path);
         }
@@ -197,9 +210,20 @@ impl Studio {
         self.player.set_track(None);
         e.status = Status::Loading;
 
-        let (gen, path, cancel, tx, ctx2) = (self.gen, e.path.clone(), self.cancel.clone(), self.tx.clone(), ctx.clone());
+        let (gen, path, cancel, tx, ctx2, ffmpeg) = (self.gen, e.path.clone(), self.cancel.clone(), self.tx.clone(), ctx.clone(), self.ffmpeg.clone());
+        let spacer_len = if e.spacer { Some(e.duration.unwrap_or(1.0).max(0.1)) } else { None };
         std::thread::spawn(move || {
-            let res = match decode::decode_file(&path, &cancel) {
+            if let Some(len) = spacer_len {
+                // 1 kHz mono silence: a few KB per second instead of megabytes
+                let sr = 1000u32;
+                let samples = vec![0.0f32; (len * sr as f32) as usize + 2];
+                let wave = Waveform::build(&samples, 1, sr);
+                let track = Arc::new(Track { samples, channels: 1, sample_rate: sr });
+                let _ = tx.send(Msg::Decoded { id, gen, res: Ok((track, Arc::new(wave), TrackMeta::default())) });
+                ctx2.request_repaint();
+                return;
+            }
+            let res = match decode::decode_any(&path, ffmpeg.as_deref(), &cancel) {
                 Ok(d) => {
                     let wave = Waveform::build(&d.samples, d.channels, d.sample_rate);
                     let track = Arc::new(Track { samples: d.samples, channels: d.channels, sample_rate: d.sample_rate });
@@ -221,6 +245,7 @@ impl Studio {
         self.analyzing = true;
         self.progress = 0.0;
         self.stale_since = None;
+        let is_spacer = self.entries.iter().any(|e| e.id == l.id && e.spacer);
         let (gen, track, cfg, cancel, tx, ctx2) =
             (self.gen, l.track.clone(), cfg.clone(), self.cancel.clone(), self.tx.clone(), ctx.clone());
         let rate = analysis_rate_for_fps(self.fps);
@@ -228,10 +253,12 @@ impl Studio {
             let txp = tx.clone();
             let ctxp = ctx2.clone();
             let keep = crate::fxtrack::keep_for(&cfg);
-            let tr = offline::analyze(&track.samples, track.channels, track.sample_rate, &cfg.audio, rate, keep, &cancel, |p| {
-                let _ = txp.send(Msg::Progress { gen, p: p * 0.7 });
-                ctxp.request_repaint();
-            });
+            let tr = if is_spacer { Some(offline::silent(track.duration_s(), rate, &cfg.audio)) } else {
+                offline::analyze(&track.samples, track.channels, track.sample_rate, &cfg.audio, rate, keep, &cancel, |p| {
+                    let _ = txp.send(Msg::Progress { gen, p: p * 0.7 });
+                    ctxp.request_repaint();
+                })
+            };
             let Some(tr) = tr else { return };
             let fx = FxTrack::build(&tr, &cfg, |p| {
                 let _ = tx.send(Msg::Progress { gen, p: 0.7 + p * 0.3 });
@@ -267,7 +294,7 @@ impl Studio {
                     match res {
                         Ok((track, wave, meta)) => {
                             if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
-                                e.duration = Some(track.duration_s());
+                                if !e.spacer { e.duration = Some(track.duration_s()); } // a spacer keeps its exact length
                                 e.status = Status::Analyzing;
                                 self.pending_track_info = Some(TrackInfo {
                                     title: meta.title.clone(), artist: meta.artist.clone(),
@@ -317,6 +344,13 @@ impl Studio {
                 let since = *self.stale_since.get_or_insert_with(Instant::now);
                 if since.elapsed() > Duration::from_millis(400) { self.spawn_analysis(ctx, cfg); }
                 else { ctx.request_repaint_after(Duration::from_millis(100)); }
+            }
+        }
+
+        if let Some(id) = self.spacer_dirty {
+            if !ctx.input(|i| i.pointer.any_down()) {
+                self.spacer_dirty = None;
+                if self.selected == Some(id) { let play = self.player.is_playing(); self.select(ctx, id, play); }
             }
         }
 
@@ -410,7 +444,7 @@ impl Studio {
         for (i, e) in self.entries.iter().enumerate() {
             if matches!(e.status, Status::Failed(_)) { return None; }
             let d = e.duration?;
-            v.push(visualizer_core::export::AudioSeg { path: e.path.clone(), start_s: offs[i] as f64, dur_s: d as f64 });
+            v.push(visualizer_core::export::AudioSeg { path: e.path.clone(), start_s: offs[i] as f64, dur_s: d as f64, silent: e.spacer });
         }
         Some(v)
     }
@@ -421,12 +455,23 @@ impl Studio {
     pub fn ui_audio(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sequence: &mut bool) {
         let mut action: Option<Action> = None;
         ui.horizontal(|ui| {
-            if ui.button("+ Add audio...").clicked() { self.open_dialog(ctx); }
+            if ui.button("+ Add audio / video...").clicked() { self.open_dialog(ctx); }
             ui.small("or drop files / Ctrl+I");
         });
+        ui.small("A video's sound can drive the visualizer (needs ffmpeg).");
         ui.checkbox(sequence, "One timeline: all tracks back to back")
             .on_hover_text("Off: every track is its own timeline and its own video.\nOn: tracks are placed one after another; playback, the timeline and the export treat them as ONE long video.");
-        if !*sequence { ui.checkbox(&mut self.autoplay_next, "Play next track automatically"); }
+        let mut add_spacer: Option<f32> = None;
+        if *sequence {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Add a silent spacer:");
+                for s in [1.0_f32, 2.0, 5.0, 10.0] {
+                    if ui.small_button(format!("{s:.0} s")).on_hover_text("Silence between tracks, inserted after the selected one. Change its length in the list or by dragging its right edge on the timeline.").clicked() { add_spacer = Some(s); }
+                }
+            });
+        } else {
+            ui.checkbox(&mut self.autoplay_next, "Play next track automatically");
+        }
         if let Some(e) = self.player.error() {
             ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Audio output: {e}"));
         }
@@ -442,9 +487,16 @@ impl Studio {
             ui.horizontal(|ui| {
                 let sel = Some(e.id) == self.selected;
                 let dur = e.duration.map(fmt_time).unwrap_or_else(|| "--:--".into());
-                let label = if seq { format!("{}  {}  [{}]", fmt_time(offs[i]), e.display(), dur) } else { format!("{}  [{}]", e.display(), dur) };
-                let width = (ui.available_width() - 76.0).max(40.0);
+                let own = if e.look.is_some() { "* " } else { "" }; // * = has its own visualizer settings
+                let label = if seq { format!("{}  {}{}  [{}]", fmt_time(offs[i]), own, e.display(), dur) } else { format!("{}{}  [{}]", own, e.display(), dur) };
+                let reserve = if e.spacer { 76.0 + 78.0 } else { 76.0 };
+                let width = (ui.available_width() - reserve).max(40.0);
                 if crate::ui_util::clipped_selectable(ui, sel, &label, width).clicked() { action = Some(Action::Select(e.id)); }
+                if e.spacer {
+                    let mut len = e.duration.unwrap_or(1.0);
+                    let r = crate::ui_util::drag_reset(ui, &mut len, 0.1..=600.0, 0.05, "", " s", 2.0);
+                    if r.changed() || r.secondary_clicked() { action = Some(Action::SpacerLen(e.id, len)); }
+                }
                 if ui.small_button("x").on_hover_text("Remove from the list").clicked() { action = Some(Action::Remove(e.id)); }
                 if ui.small_button("v").on_hover_text("Move down").clicked() { action = Some(Action::Move(e.id, 1)); }
                 if ui.small_button("^").on_hover_text("Move up").clicked() { action = Some(Action::Move(e.id, -1)); }
@@ -463,8 +515,11 @@ impl Studio {
             Some(Action::Select(id)) => self.select(ctx, id, false),
             Some(Action::Remove(id)) => self.remove(ctx, id),
             Some(Action::Move(id, d)) => self.move_entry(id, d),
+            Some(Action::SpacerLen(id, len)) => self.set_spacer_len(id, len),
             None => {}
         }
+        if let Some(sec) = add_spacer { self.add_spacer(sec); }
+        if self.entries.iter().any(|e| e.look.is_some()) { ui.small("* = this track has its own visualizer settings"); }
     }
 
     /// Transport + timeline. The panel is resizable (drag its top edge); the waveform fills the height.
@@ -480,12 +535,13 @@ impl Studio {
 
         let offs = self.offsets();
         let segs: Vec<timeline::Seg> = if self.sequence {
-            self.entries.iter().enumerate().map(|(i, e)| timeline::Seg { start: offs[i], len: e.duration.unwrap_or(0.0), name: e.display(), current: Some(e.id) == self.selected }).collect()
+            self.entries.iter().enumerate().map(|(i, e)| timeline::Seg { start: offs[i], len: e.duration.unwrap_or(0.0), name: e.display(), current: Some(e.id) == self.selected, spacer: e.spacer }).collect()
         } else { Vec::new() };
         let wave_off = if self.sequence { self.sel_index().map(|i| offs[i]).unwrap_or(0.0) } else { 0.0 };
 
         let mut jump: Option<i32> = None;
         let mut seek: Option<f32> = None;
+        let mut spacer_edit: Option<(usize, f32)> = None;
         egui::TopBottomPanel::bottom("studio_transport").resizable(true).default_height(270.0).height_range(150.0..=900.0).show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -519,11 +575,15 @@ impl Studio {
                 analysing: if self.analyzing { Some(self.progress) } else { None },
             });
             seek = out.seek;
+            spacer_edit = out.spacer;
             // Fill the panel exactly. If the content were even a pixel shorter, egui would shrink the
             // panel to the content every frame (the "slowly falls back" effect).
             let rest = ui.available_height();
             if rest > 0.0 { ui.allocate_space(egui::vec2(1.0, rest)); }
         });
+        if let Some((i, len)) = spacer_edit {
+            if let Some(id) = self.entries.get(i).filter(|e| e.spacer).map(|e| e.id) { self.set_spacer_len(id, len); }
+        }
         if let Some(t) = seek { self.seek_global(ctx, t); }
 
         if let Some(d) = jump {
@@ -594,6 +654,59 @@ impl Studio {
         if self.loaded.is_none() { if let Some(id) = self.selected { self.select(ctx, id, false); } }
     }
 
+    // ── spacers ──────────────────────────────────────────────
+
+    /// Insert a silent spacer after the selected entry (or at the end).
+    pub fn add_spacer(&mut self, secs: f32) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let at = self.sel_index().map(|i| i + 1).unwrap_or(self.entries.len());
+        self.entries.insert(at, Entry { id, path: PathBuf::new(), meta: TrackMeta { title: "Spacer".into(), ..Default::default() },
+            duration: Some(secs.max(0.1)), status: Status::Pending, spacer: true, look: None });
+        self.list_gen += 1;
+    }
+
+    pub fn set_spacer_len(&mut self, id: u64, secs: f32) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id && e.spacer) {
+            e.duration = Some(secs.clamp(0.1, 600.0));
+            self.list_gen += 1;
+            self.spacer_dirty = Some(id);
+        }
+    }
+
+    // ── per-track visualizer settings ────────────────────────
+
+    pub fn selected_index(&self) -> Option<usize> { self.sel_index() }
+    pub fn selected_look(&self) -> Option<&TrackLook> { self.sel_index().and_then(|i| self.entries[i].look.as_ref()) }
+    pub fn selected_is_spacer(&self) -> bool { self.sel_index().map(|i| self.entries[i].spacer).unwrap_or(false) }
+
+    /// Give the selected track its own settings (`Some`), or hand it back to the project look (`None`).
+    pub fn set_selected_look(&mut self, cfg: Option<AppConfig>) {
+        if let Some(i) = self.sel_index() {
+            self.entries[i].look = cfg.map(|c| TrackLook { rev: 1, config: c });
+            self.list_gen += 1;
+        }
+    }
+    /// The live settings changed while a track with its own settings is selected: store them in that track.
+    pub fn store_selected_look(&mut self, cfg: &AppConfig) {
+        if let Some(i) = self.sel_index() {
+            if let Some(l) = self.entries[i].look.as_mut() { l.config = cfg.clone(); l.rev = l.rev.wrapping_add(1); self.list_gen += 1; }
+        }
+    }
+
+    /// ffmpeg became available: entries that failed only because it was missing get another try.
+    pub fn set_ffmpeg(&mut self, ctx: &egui::Context, ffmpeg: Option<PathBuf>) {
+        if self.ffmpeg == ffmpeg { return; }
+        self.ffmpeg = ffmpeg;
+        if self.ffmpeg.is_none() { return; }
+        let retry: Vec<(u64, PathBuf)> = self.entries.iter()
+            .filter(|e| !e.spacer && matches!(&e.status, Status::Failed(m) if m.contains("ffmpeg"))).map(|e| (e.id, e.path.clone())).collect();
+        for (id, path) in retry {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) { e.status = Status::Pending; }
+            self.spawn_probe(ctx, id, path);
+        }
+    }
+
     /// True while a file owns the title/cover (the app should ignore system media-session updates).
     pub fn owns_track_info(&self) -> bool { self.selected.is_some() }
 }
@@ -613,13 +726,20 @@ impl Studio {
 impl Studio {
     /// The file list as project items (call only when `list_gen` changed: it stats every file).
     pub fn audio_items(&self, dir: Option<&std::path::Path>) -> Vec<AudioItem> {
-        self.entries.iter().map(|e| AudioItem { id: e.id, media: MediaRef::new(&e.path, dir), range: None }).collect()
+        self.entries.iter().map(|e| {
+            if e.spacer {
+                AudioItem { id: e.id, media: MediaRef { path: PathBuf::new(), rel: None, size: 0 }, range: None,
+                            silence_s: e.duration.map(|d| d as f64), look: e.look.clone() }
+            } else {
+                AudioItem { id: e.id, media: MediaRef::new(&e.path, dir), range: None, silence_s: None, look: e.look.clone() }
+            }
+        }).collect()
     }
 
     fn spawn_probe(&self, ctx: &egui::Context, id: u64, path: PathBuf) {
-        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        let (tx, ctx2, ff) = (self.tx.clone(), ctx.clone(), self.ffmpeg.clone());
         std::thread::spawn(move || {
-            let res = probe_with_duration(&path);
+            let res = probe_with_duration(&path, ff.as_deref());
             let _ = tx.send(Msg::Probed { id, res });
             ctx2.request_repaint();
         });
@@ -631,13 +751,33 @@ impl Studio {
         let mut old = std::mem::take(&mut self.entries);
         let mut fresh: Vec<Entry> = Vec::with_capacity(items.len());
         for it in items {
+            if let Some(len) = it.silence_s {
+                // spacers have no file: reuse one of the same length, otherwise make a new one
+                if let Some(pos) = old.iter().position(|e| e.spacer && (e.duration.unwrap_or(0.0) - len as f32).abs() < 1e-3) {
+                    let mut e = old.remove(pos);
+                    e.look = it.look.clone();
+                    fresh.push(e);
+                } else {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    fresh.push(Entry { id, path: PathBuf::new(), meta: TrackMeta { title: "Spacer".into(), ..Default::default() },
+                        duration: Some(len as f32), status: Status::Pending, spacer: true, look: it.look.clone() });
+                }
+                continue;
+            }
             let path = it.media.resolve(dir).unwrap_or_else(|| it.media.path.clone());
-            if let Some(pos) = old.iter().position(|e| e.path == path) { fresh.push(old.remove(pos)); continue; }
+            if let Some(pos) = old.iter().position(|e| e.path == path && !e.spacer) {
+                let mut e = old.remove(pos);
+                e.look = it.look.clone();
+                fresh.push(e);
+                continue;
+            }
             let id = self.next_id;
             self.next_id += 1;
             let exists = path.is_file();
             fresh.push(Entry { id, path: path.clone(), meta: TrackMeta::default(), duration: None,
-                status: if exists { Status::Pending } else { Status::Failed("File is missing - use File > Missing files".into()) } });
+                status: if exists { Status::Pending } else { Status::Failed("File is missing - use File > Missing files".into()) },
+                spacer: false, look: it.look.clone() });
             if exists { self.spawn_probe(ctx, id, path); }
         }
         let selected_gone = self.selected.map(|s| old.iter().any(|e| e.id == s)).unwrap_or(false);

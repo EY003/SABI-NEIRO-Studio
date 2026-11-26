@@ -33,6 +33,8 @@ pub struct LayersUi {
     fonts_rx: Option<Receiver<Vec<SysFont>>>,
     fonts_requested: bool,
     font_filter: String,
+    /// A video layer asked for its sound to be added as an audio track (the app picks this up).
+    pub audio_from_video: Option<PathBuf>,
 }
 
 fn kind_label(k: &LayerKind) -> &'static str {
@@ -41,7 +43,7 @@ fn kind_label(k: &LayerKind) -> &'static str {
 
 impl LayersUi {
     pub fn new() -> Self {
-        Self { selected: None, pick: None, sys_fonts: vec![], fonts_rx: None, fonts_requested: false, font_filter: String::new() }
+        Self { selected: None, pick: None, sys_fonts: vec![], fonts_rx: None, fonts_requested: false, font_filter: String::new(), audio_from_video: None }
     }
 
     fn start_pick(&mut self, what: Pick) {
@@ -159,7 +161,7 @@ impl LayersUi {
             ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut l.name); });
             slider_reset(ui, &mut l.opacity, 0.0..=1.0, "Opacity", 1.0);
 
-            egui::CollapsingHeader::new("Timing and fades").default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new("Timing and fades").default_open(true).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Start");
                     drag_reset(ui, &mut l.start_s, 0.0..=36_000.0, 0.1, "", " s", 0.0);
@@ -179,6 +181,20 @@ impl LayersUi {
                     ui.label("out");
                     drag_reset(ui, &mut l.fade_out_s, 0.0..=30.0, 0.05, "", " s", 0.0);
                 });
+                // one-click presets
+                const PRESETS: [(f32, &str); 5] = [(0.0, "Off"), (0.5, "0.5 s"), (1.0, "1 s"), (2.0, "2 s"), (3.0, "3 s")];
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("In:  ");
+                    for (v, n) in PRESETS { if ui.small_button(n).clicked() { l.fade_in_s = v; } }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Out: ");
+                    for (v, n) in PRESETS { if ui.small_button(n).clicked() { l.fade_out_s = v; } }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Both:");
+                    for (v, n) in PRESETS { if ui.small_button(n).on_hover_text("Fade in and out").clicked() { l.fade_in_s = v; l.fade_out_s = v; } }
+                });
                 ui.small("Tip: drag the layer's bar on the timeline, or press [ and ] to set its start / end at the playhead.");
             });
 
@@ -195,6 +211,9 @@ impl LayersUi {
                     let w = ui.available_width();
                     ui_util::clipped_label(ui, &media.path.display().to_string(), w, true, None);
                     if ui.button("Replace file...").clicked() { self.start_pick(Pick::Replace(id)); }
+                    if ui.button("Use this video's sound as an audio track").on_hover_text("Adds the video as an entry in the Audio tab: its sound drives the visualizer. Keep this layer muted so the sound is not doubled.").clicked() {
+                        self.audio_from_video = Some(media.path.clone());
+                    }
                     fit_ui(ui, fit, offset, scale);
                     ui.checkbox(looping, "Loop");
                     ui.checkbox(mute, "Mute");

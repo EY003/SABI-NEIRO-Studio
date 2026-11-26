@@ -32,10 +32,12 @@ enum Drag {
     None, Seek, Pan, RangeIn, RangeOut,
     RangeMove { grab: f64 }, RangeNew { anchor: f64 },
     LayerMove { id: u64, grab: f64 }, LayerStart(u64), LayerEnd(u64),
+    /// right edge of a spacer block (index in `segs`)
+    SpacerEdge(usize),
 }
 
 /// One audio file on the timeline (only more than one in sequence mode).
-pub struct Seg { pub start: f32, pub len: f32, pub name: String, pub current: bool }
+pub struct Seg { pub start: f32, pub len: f32, pub name: String, pub current: bool, pub spacer: bool }
 
 pub struct In<'a> {
     pub dur: f32,
@@ -49,10 +51,23 @@ pub struct In<'a> {
     pub selected: &'a mut Option<u64>,
     pub analysing: Option<f32>,
 }
-pub struct Out { pub seek: Option<f32> }
+pub struct Out {
+    pub seek: Option<f32>,
+    /// (index in `segs`, new length in seconds) while a spacer's right edge is dragged
+    pub spacer: Option<(usize, f32)>,
+}
 
-pub struct Timeline { t0: f32, len: f32, drag: Drag, /// show the whole timeline and keep showing it as the length changes
-    fit: bool, snap_line: Option<f64> }
+pub struct Timeline {
+    t0: f32, len: f32, drag: Drag,
+    /// show the whole timeline and keep showing it as the length changes
+    fit: bool,
+    snap_line: Option<f64>,
+    /// layer under the pointer when the right-click menu was opened
+    ctx_layer: Option<u64>,
+}
+
+/// One-click fade lengths (seconds); 0 = off.
+const FADE_PRESETS: [(f32, &str); 5] = [(0.0, "Off"), (0.5, "0.5 s"), (1.0, "1 s"), (2.0, "2 s"), (3.0, "3 s")];
 
 struct Geo { rect: egui::Rect, ruler: egui::Rect, rng: egui::Rect, wave: egui::Rect, rows_y: f32, row_h: f32, t0: f32, len: f32 }
 impl Geo {
@@ -73,7 +88,7 @@ fn nice_step(px_per_s: f32) -> f32 {
     3600.0
 }
 
-fn hit_test(g: &Geo, p: egui::Pos2, range: Option<(f64, f64)>, layers: &[Layer], rows: &[usize], dur: f32) -> Drag {
+fn hit_test(g: &Geo, p: egui::Pos2, range: Option<(f64, f64)>, layers: &[Layer], rows: &[usize], dur: f32, segs: &[Seg]) -> Drag {
     let t = g.t(p.x).clamp(0.0, dur) as f64;
     let near = |x: f32| (p.x - x).abs() <= GRAB_PX;
     if g.rng.contains(p) {
@@ -86,6 +101,12 @@ fn hit_test(g: &Geo, p: egui::Pos2, range: Option<(f64, f64)>, layers: &[Layer],
             }
             None => Drag::RangeNew { anchor: t },
         };
+    }
+    if g.wave.contains(p) {
+        // the right edge of a silent spacer resizes it
+        for (i, s) in segs.iter().enumerate() {
+            if s.spacer && near(g.x(s.start + s.len)) { return Drag::SpacerEdge(i); }
+        }
     }
     if g.wave.contains(p) || g.ruler.contains(p) {
         if let (Some((a, b)), true) = (range, g.wave.contains(p)) {
@@ -112,7 +133,7 @@ fn hit_test(g: &Geo, p: egui::Pos2, range: Option<(f64, f64)>, layers: &[Layer],
 }
 
 impl Timeline {
-    pub fn new() -> Self { Self { t0: 0.0, len: 0.0, drag: Drag::None, fit: true, snap_line: None } }
+    pub fn new() -> Self { Self { t0: 0.0, len: 0.0, drag: Drag::None, fit: true, snap_line: None, ctx_layer: None } }
     pub fn fit(&mut self) { self.fit = true; self.len = 0.0; self.t0 = 0.0; }
     /// Zoom around `center` (seconds); factor > 1 zooms in.
     pub fn zoom_step(&mut self, factor: f32, center: f32, dur: f32) {
@@ -178,13 +199,13 @@ impl Timeline {
         let px_per_s = w / g.len;
 
         // ── cursor feedback ──
-        let hover = resp.hover_pos().filter(|_| self.drag == Drag::None).map(|p| hit_test(&g, p, *range, layers, &rows, dur));
+        let hover = resp.hover_pos().filter(|_| self.drag == Drag::None).map(|p| hit_test(&g, p, *range, layers, &rows, dur, segs));
         let icon = match self.drag {
             Drag::RangeMove { .. } | Drag::LayerMove { .. } => Some(egui::CursorIcon::Grabbing),
-            Drag::RangeIn | Drag::RangeOut | Drag::LayerStart(_) | Drag::LayerEnd(_) => Some(egui::CursorIcon::ResizeHorizontal),
+            Drag::RangeIn | Drag::RangeOut | Drag::LayerStart(_) | Drag::LayerEnd(_) | Drag::SpacerEdge(_) => Some(egui::CursorIcon::ResizeHorizontal),
             Drag::Pan => Some(egui::CursorIcon::Grabbing),
             _ => match hover {
-                Some(Drag::RangeIn) | Some(Drag::RangeOut) | Some(Drag::LayerStart(_)) | Some(Drag::LayerEnd(_)) => Some(egui::CursorIcon::ResizeHorizontal),
+                Some(Drag::RangeIn) | Some(Drag::RangeOut) | Some(Drag::LayerStart(_)) | Some(Drag::LayerEnd(_)) | Some(Drag::SpacerEdge(_)) => Some(egui::CursorIcon::ResizeHorizontal),
                 Some(Drag::RangeMove { .. }) | Some(Drag::LayerMove { .. }) => Some(egui::CursorIcon::Grab),
                 Some(Drag::RangeNew { .. }) => Some(egui::CursorIcon::Crosshair),
                 _ => None,
@@ -219,14 +240,14 @@ impl Timeline {
         };
 
         // ── drag start (hit-test where the button went DOWN: by the time egui reports a drag the pointer has already moved) ──
-        let mut out = Out { seek: None };
+        let mut out = Out { seek: None, spacer: None };
         if resp.drag_started() {
             self.drag = Drag::None;
             let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
             if let Some(p) = origin {
                 if ui.input(|i| i.pointer.middle_down()) { self.drag = Drag::Pan; }
                 else {
-                    self.drag = hit_test(&g, p, *range, layers, &rows, dur);
+                    self.drag = hit_test(&g, p, *range, layers, &rows, dur, segs);
                     if let Drag::LayerMove { id, .. } | Drag::LayerStart(id) | Drag::LayerEnd(id) = self.drag { *selected = Some(id); }
                 }
             }
@@ -287,12 +308,15 @@ impl Timeline {
                         let t = snapped.unwrap_or(t);
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) { l.end_s = Some(t.max(l.start_s + 0.1).min(dur as f64)); }
                     }
+                    Drag::SpacerEdge(i) => if let Some(sg) = segs.get(i) {
+                        out.spacer = Some((i, (t as f32 - sg.start).max(0.1)));
+                    },
                     Drag::None => {}
                 }
             }
         } else if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                match hit_test(&g, p, *range, layers, &rows, dur) {
+                match hit_test(&g, p, *range, layers, &rows, dur, segs) {
                     Drag::Seek => out.seek = Some(g.t(p.x).clamp(0.0, dur)),
                     Drag::LayerMove { id, .. } | Drag::LayerStart(id) | Drag::LayerEnd(id) => *selected = Some(id),
                     _ => {}
@@ -302,7 +326,7 @@ impl Timeline {
         self.snap_line = snapped;
         if resp.double_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                match hit_test(&g, p, *range, layers, &rows, dur) {
+                match hit_test(&g, p, *range, layers, &rows, dur, segs) {
                     Drag::LayerMove { id, .. } | Drag::LayerStart(id) | Drag::LayerEnd(id) => {
                         if let Some(l) = layers.iter_mut().find(|l| l.id == id) { l.start_s = 0.0; l.end_s = None; }
                     }
@@ -338,7 +362,18 @@ impl Timeline {
             if xb <= xa { continue; }
             let band = egui::Rect::from_min_max(egui::pos2(xa, g.wave.top()), egui::pos2(xb, g.wave.bottom()));
             let tint = if s.current { 26 } else if i % 2 == 0 { 14 } else { 20 };
-            painter.rect_filled(band, 0.0, egui::Color32::from_gray(tint));
+            painter.rect_filled(band, 0.0, if s.spacer { egui::Color32::from_rgb(34, 30, 8) } else { egui::Color32::from_gray(tint) });
+            if s.spacer {
+                // diagonal hatching marks "silence"
+                let mut x = band.left() - band.height();
+                while x < band.right() {
+                    let (a, b) = (egui::pos2(x.max(band.left()), band.bottom() - (band.left() - x).max(0.0)), egui::pos2((x + band.height()).min(band.right()), band.top() + (x + band.height() - band.right()).max(0.0)));
+                    painter.line_segment([a, b], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 62, 20)));
+                    x += 14.0;
+                }
+                let hx = band.right();
+                painter.rect_filled(egui::Rect::from_center_size(egui::pos2(hx - 2.0, band.center().y), egui::vec2(5.0, band.height() * 0.5)), 2.0, SNAP);
+            }
             if segs.len() > 1 {
                 painter.line_segment([egui::pos2(xa, g.wave.top()), egui::pos2(xa, g.wave.bottom())], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)));
                 painter.with_clip_rect(band).text(egui::pos2(xa + 4.0, g.wave.top() + 2.0), egui::Align2::LEFT_TOP,
@@ -436,7 +471,27 @@ impl Timeline {
             painter.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, g.wave.bottom() + rows_h + 4.0)], egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
             painter.add(egui::Shape::convex_polygon(vec![egui::pos2(px - 5.0, rect.top()), egui::pos2(px + 5.0, rect.top()), egui::pos2(px, rect.top() + 8.0)], egui::Color32::WHITE, egui::Stroke::NONE));
         }
-        ui.add(egui::Label::new(egui::RichText::new("Wheel: zoom   Shift+wheel / middle-drag: pan   Drag the strip: render range   Drag bars: move / trim   Shift: no snapping").small().weak()).wrap(false));
+        // right-click a layer bar: one-click fade presets
+        if resp.secondary_clicked() {
+            self.ctx_layer = resp.interact_pointer_pos().and_then(|p| match hit_test(&g, p, *range, layers, &rows, dur, segs) {
+                Drag::LayerMove { id, .. } | Drag::LayerStart(id) | Drag::LayerEnd(id) => Some(id),
+                _ => None,
+            });
+            if let Some(id) = self.ctx_layer { *selected = Some(id); }
+        }
+        let ctx_layer = self.ctx_layer;
+        resp.context_menu(|ui| {
+            match ctx_layer.and_then(|id| layers.iter_mut().find(|l| l.id == id)) {
+                Some(l) => {
+                    ui.label(egui::RichText::new(format!("Fades: {}", l.name)).strong());
+                    ui.horizontal(|ui| { ui.label("Fade in "); for (v, name) in FADE_PRESETS { if ui.small_button(name).clicked() { l.fade_in_s = v; ui.close_menu(); } } });
+                    ui.horizontal(|ui| { ui.label("Fade out"); for (v, name) in FADE_PRESETS { if ui.small_button(name).clicked() { l.fade_out_s = v; ui.close_menu(); } } });
+                    ui.horizontal(|ui| { ui.label("Both    "); for (v, name) in FADE_PRESETS { if ui.small_button(name).clicked() { l.fade_in_s = v; l.fade_out_s = v; ui.close_menu(); } } });
+                }
+                None => { ui.small("Right-click a layer bar to set its fades."); }
+            }
+        });
+        ui.add(egui::Label::new(egui::RichText::new("Wheel: zoom   Shift+wheel / middle-drag: pan   Drag the strip: render range   Drag bars: move / trim   Right-click a bar: fades   Shift: no snapping").small().weak()).wrap(false));
         out
     }
 }
