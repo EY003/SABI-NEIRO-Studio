@@ -258,7 +258,13 @@ pub fn video_args(s: &RenderSettings) -> Vec<String> {
 /// forced with `-f` so the extension does not matter.
 /// One audio file placed on the (global) timeline.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AudioSeg { pub path: PathBuf, pub start_s: f64, pub dur_s: f64 }
+pub struct AudioSeg {
+    pub path: PathBuf,
+    pub start_s: f64,
+    pub dur_s: f64,
+    /// A silent spacer: no file, ffmpeg generates the silence.
+    pub silent: bool,
+}
 
 pub fn build_args(s: &RenderSettings, audio: &[AudioSeg], out: &Path, start: f64, dur: f64, extras: &[ExtraAudio]) -> Vec<String> {
     let mut a: Vec<String> = ["-y", "-hide_banner", "-loglevel", "error", "-nostats"].iter().map(|x| x.to_string()).collect();
@@ -270,7 +276,7 @@ pub fn build_args(s: &RenderSettings, audio: &[AudioSeg], out: &Path, start: f64
     let end = start + dur;
     let mut used: Vec<&AudioSeg> = audio.iter().filter(|g| g.start_s + g.dur_s > start && g.start_s < end).collect();
     if used.is_empty() { used = audio.iter().take(1).collect(); }
-    let single = used.len() <= 1;
+    let single = used.len() <= 1 && !used.first().map(|g| g.silent).unwrap_or(false);
     let n_audio = used.len().max(1);
     let main_label: String;
     let mut fc: Vec<String> = Vec::new();
@@ -281,7 +287,11 @@ pub fn build_args(s: &RenderSettings, audio: &[AudioSeg], out: &Path, start: f64
     } else {
         let mut labels = String::new();
         for (i, g) in used.iter().enumerate() {
-            a.extend(["-i".into(), g.path.to_string_lossy().into_owned()]);
+            if g.silent {
+                a.extend(["-f".into(), "lavfi".into(), "-t".into(), format!("{:.6}", g.dur_s), "-i".into(), "anullsrc=channel_layout=stereo:sample_rate=48000".into()]);
+            } else {
+                a.extend(["-i".into(), g.path.to_string_lossy().into_owned()]);
+            }
             let ls = (start - g.start_s).max(0.0);
             let le = (end - g.start_s).min(g.dur_s);
             fc.push(format!("[{}:a]atrim=start={ls:.6}:end={le:.6},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[s{i}]", i + 1));
@@ -559,7 +569,7 @@ mod tests {
     #[test]
     fn h264_mp4_args() {
         let s = RenderSettings::default();
-        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0 };
+        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0, silent: false };
         let a = build_args(&s, &[seg], Path::new("o.part"), 0.0, 10.0, &[]).join(" ");
         assert!(a.contains("-c:v libx264") && a.contains("-crf") && a.contains("yuv420p"));
         assert!(a.contains("-f mp4") && a.contains("vflip") && a.contains("-c:a aac"));
@@ -568,22 +578,31 @@ mod tests {
     fn extra_audio_is_mixed() {
         let s = RenderSettings::default();
         let e = ExtraAudio { path: PathBuf::from("bg.mp4"), seek_s: 2.0, delay_s: 1.5, volume: 0.5 };
-        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0 };
+        let seg = AudioSeg { path: PathBuf::from("a.flac"), start_s: 0.0, dur_s: 60.0, silent: false };
         let a = build_args(&s, &[seg], Path::new("o.part"), 0.0, 10.0, &[e]).join(" ");
         assert!(a.contains("amix=inputs=2") && a.contains("adelay=1500|1500") && a.contains("-map [aout]"));
     }
     #[test]
     fn sequence_concat() {
         let s = RenderSettings::default();
-        let segs = [AudioSeg { path: PathBuf::from("a.mp3"), start_s: 0.0, dur_s: 100.0 },
-                    AudioSeg { path: PathBuf::from("b.mp3"), start_s: 100.0, dur_s: 100.0 },
-                    AudioSeg { path: PathBuf::from("c.mp3"), start_s: 200.0, dur_s: 100.0 }];
+        let segs = [AudioSeg { path: PathBuf::from("a.mp3"), start_s: 0.0, dur_s: 100.0, silent: false },
+                    AudioSeg { path: PathBuf::from("b.mp3"), start_s: 100.0, dur_s: 100.0, silent: false },
+                    AudioSeg { path: PathBuf::from("c.mp3"), start_s: 200.0, dur_s: 100.0, silent: false }];
         // range 90..210 touches all three; trims: a 90..100, b 0..100, c 0..10
         let a = build_args(&s, &segs, Path::new("o.part"), 90.0, 120.0, &[]).join(" ");
         assert!(a.contains("concat=n=3") && a.contains("atrim=start=90.000000:end=100.000000") && a.contains("atrim=start=0.000000:end=10.000000"));
         // a range inside one file keeps the simple path
         let a = build_args(&s, &segs, Path::new("o.part"), 110.0, 10.0, &[]).join(" ");
         assert!(!a.contains("concat") && a.contains("-ss 10.000000"));
+    }
+    #[test]
+    fn spacer_becomes_generated_silence() {
+        let s = RenderSettings::default();
+        let segs = [AudioSeg { path: PathBuf::from("a.mp3"), start_s: 0.0, dur_s: 10.0, silent: false },
+                    AudioSeg { path: PathBuf::new(), start_s: 10.0, dur_s: 3.0, silent: true },
+                    AudioSeg { path: PathBuf::from("b.mp3"), start_s: 13.0, dur_s: 10.0, silent: false }];
+        let a = build_args(&s, &segs, Path::new("o.part"), 0.0, 23.0, &[]).join(" ");
+        assert!(a.contains("anullsrc") && a.contains("concat=n=3"));
     }
     #[test]
     fn preview_canvas() {

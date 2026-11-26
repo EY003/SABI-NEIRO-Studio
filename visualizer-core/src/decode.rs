@@ -173,3 +173,92 @@ pub fn probe_file(path: &Path) -> Result<(TrackMeta, Option<f32>), DecodeError> 
     };
     Ok((meta, dur))
 }
+
+// ── ffmpeg-based decoding: video files, and audio formats symphonia lacks (Opus, WMA, AC-3 ...) ──
+
+pub fn is_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "wmv" | "flv" | "mpg" | "mpeg" | "ts" | "m2ts")
+    )
+}
+
+/// Length from `ffmpeg -i` (it prints "Duration: HH:MM:SS.xx" on stderr).
+pub fn ffmpeg_duration(ffmpeg: &Path, path: &Path) -> Option<f32> {
+    let mut c = std::process::Command::new(ffmpeg);
+    c.args(["-hide_banner", "-i"]).arg(path)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    let out = crate::export::spawn_hidden(&mut c).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Duration:") {
+            let t = rest.trim().split(',').next()?.trim();
+            let p: Vec<f32> = t.split(':').filter_map(|x| x.parse().ok()).collect();
+            if p.len() == 3 { return Some(p[0] * 3600.0 + p[1] * 60.0 + p[2]); }
+        }
+    }
+    None
+}
+
+/// Decode any audio stream through ffmpeg as stereo 48 kHz f32.
+pub fn decode_with_ffmpeg(ffmpeg: &Path, path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, DecodeError> {
+    use std::io::Read;
+    let mut c = std::process::Command::new(ffmpeg);
+    c.args(["-v", "error", "-nostdin", "-i"]).arg(path)
+        .args(["-vn", "-sn", "-dn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1"])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let mut child = crate::export::spawn_hidden(&mut c).spawn().map_err(|e| DecodeError::Io(format!("cannot start ffmpeg: {e}")))?;
+    let mut out = child.stdout.take().ok_or_else(|| DecodeError::Io("no ffmpeg output".into()))?;
+
+    let mut samples: Vec<f32> = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut carry: Vec<u8> = Vec::with_capacity(4); // a float can be split across two reads
+    loop {
+        if cancel.load(Ordering::Relaxed) { let _ = child.kill(); let _ = child.wait(); return Err(DecodeError::Cancelled); }
+        let n = match out.read(&mut buf) { Ok(0) => break, Ok(n) => n, Err(e) => { let _ = child.kill(); return Err(DecodeError::Io(e.to_string())); } };
+        let mut data = &buf[..n];
+        while !carry.is_empty() && carry.len() < 4 && !data.is_empty() { carry.push(data[0]); data = &data[1..]; }
+        if carry.len() == 4 { samples.push(f32::from_le_bytes([carry[0], carry[1], carry[2], carry[3]])); carry.clear(); }
+        let whole = data.len() / 4 * 4;
+        for ch in data[..whole].chunks_exact(4) { samples.push(f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]])); }
+        carry.extend_from_slice(&data[whole..]);
+    }
+    let _ = child.wait();
+    if samples.len() < 4 { return Err(DecodeError::Unsupported("the file has no audio stream".into())); }
+    samples.shrink_to_fit();
+    let meta = TrackMeta { title: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(), ..Default::default() };
+    Ok(DecodedAudio { samples, channels: 2, sample_rate: 48_000, meta })
+}
+
+/// Decode with symphonia; video files (and anything symphonia cannot read) go through ffmpeg if available.
+pub fn decode_any(path: &Path, ffmpeg: Option<&Path>, cancel: &AtomicBool) -> Result<DecodedAudio, DecodeError> {
+    if is_video_path(path) {
+        return match ffmpeg {
+            Some(f) => decode_with_ffmpeg(f, path, cancel),
+            None => Err(DecodeError::Unsupported("video files need ffmpeg (see the Render panel)".into())),
+        };
+    }
+    match decode_file(path, cancel) {
+        Err(DecodeError::Unsupported(msg)) => match ffmpeg {
+            Some(f) => decode_with_ffmpeg(f, path, cancel).map_err(|_| DecodeError::Unsupported(msg)),
+            None => Err(DecodeError::Unsupported(msg)),
+        },
+        r => r,
+    }
+}
+
+/// Metadata and length without decoding (ffmpeg for video / unsupported audio).
+pub fn probe_any(path: &Path, ffmpeg: Option<&Path>) -> Result<(TrackMeta, Option<f32>), String> {
+    let stem_meta = || TrackMeta { title: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(), ..Default::default() };
+    if is_video_path(path) {
+        let f = ffmpeg.ok_or_else(|| "video files need ffmpeg (see the Render panel)".to_string())?;
+        return Ok((stem_meta(), ffmpeg_duration(f, path)));
+    }
+    match probe_file(path) {
+        Ok(r) => Ok(r),
+        Err(e) => match ffmpeg {
+            Some(f) => ffmpeg_duration(f, path).map(|d| (stem_meta(), Some(d))).ok_or_else(|| e.to_string()),
+            None => Err(e.to_string()),
+        },
+    }
+}

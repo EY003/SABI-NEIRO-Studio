@@ -139,12 +139,22 @@ impl Layer {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// A track's own visualizer settings. `rev` increases on every edit so change detection does not have
+/// to compare whole configurations.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TrackLook { pub rev: u32, pub config: AppConfig }
+
+/// One entry of the audio list: a file (audio, or a video whose sound is used) or a silent spacer.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AudioItem {
     pub id: u64,
     pub media: MediaRef,
     /// Render only this span (seconds); `None` = whole track.
     #[serde(default)] pub range: Option<(f64, f64)>,
+    /// `Some(seconds)`: a silent spacer (no file) of this length.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub silence_s: Option<f64>,
+    /// This track's own visualizer settings; `None` = the project-wide look.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub look: Option<TrackLook>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -191,13 +201,14 @@ impl ProjectDoc {
         }
         // Future migrations: `if doc.version < 2 { ...; doc.version = 2; }`
         doc.config.refresh_premade_presets(); // premade presets are not serialized
+        for a in doc.audio.iter_mut() { if let Some(l) = &mut a.look { l.config.refresh_premade_presets(); } }
         Ok(doc)
     }
 
     /// Every media reference in the project (audio, image and video layers).
     pub fn media_refs_mut(&mut self) -> Vec<&mut MediaRef> {
         let mut v: Vec<&mut MediaRef> = Vec::new();
-        for a in self.audio.iter_mut() { v.push(&mut a.media); }
+        for a in self.audio.iter_mut().filter(|a| a.silence_s.is_none()) { v.push(&mut a.media); }
         for l in self.layers.iter_mut() {
             match &mut l.kind {
                 LayerKind::Image { media, .. } | LayerKind::Video { media, .. } => v.push(media),
@@ -229,7 +240,7 @@ impl ProjectDoc {
     /// Every media file that can no longer be found.
     pub fn missing_media(&self, project_dir: &Path) -> Vec<PathBuf> {
         let mut out = vec![];
-        for a in &self.audio {
+        for a in self.audio.iter().filter(|a| a.silence_s.is_none()) {
             if a.media.resolve(project_dir).is_none() { out.push(a.media.path.clone()); }
         }
         for l in &self.layers {
